@@ -1,0 +1,9 @@
+.venv/
+.idea/
+.vscode/
+__pycache__/
+agents/__pycache__
+.env
+.DS_Store
+agents/.DS_Store
+assistant.db
