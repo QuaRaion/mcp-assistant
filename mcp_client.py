@@ -39,10 +39,21 @@ class MCPClient:
 
     # helpers
 
+    # def _headers(self) -> dict:
+    #     h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    #     if self.api_key:
+    #         h["Authorization"] = f"Bearer {self.api_key}"
+    #     return h
+
     def _headers(self) -> dict:
-        h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+        h = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
         if self.api_key:
+            # GitHub требует именно такой формат
             h["Authorization"] = f"Bearer {self.api_key}"
+            h["Github-MCP-Installed-Apps"] = ""  # иногда нужен этот заголовок
         return h
 
     def _next_id(self) -> int:
@@ -59,14 +70,35 @@ class MCPClient:
 
     # low-level transport
 
+    def _parse_response(self, resp: httpx.Response) -> dict:
+        """Парсит ответ — JSON или SSE формат."""
+        content_type = resp.headers.get("content-type", "")
+        text = resp.text
+
+        # SSE формат: "event: message\ndata: {...}"
+        if "text/event-stream" in content_type or text.startswith("event:"):
+            for line in text.split("\n"):
+                line = line.strip()
+                if line.startswith("data:"):
+                    data_str = line[5:].strip()
+                    if data_str and data_str != "[DONE]":
+                        try:
+                            return json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+            raise MCPError(f"Could not parse SSE response: {text[:200]}")
+
+        return resp.json()
+
     def _post_json(self, endpoint: str, payload: dict) -> dict:
-        """Синхронный POST, ожидаем JSON ответ."""
         url = f"{self.base_url}{endpoint}"
         with httpx.Client(timeout=MCP_REQUEST_TIMEOUT) as client:
             resp = client.post(url, json=payload, headers=self._headers())
+            logger.info(f"Request: {payload['method']}")
+            logger.info(f"Response {resp.status_code}: {resp.text[:300]}")
             resp.raise_for_status()
-            return resp.json()
-
+            return self._parse_response(resp)
+        
     def _post_sse(self, endpoint: str, payload: dict) -> dict:
         """
         POST с ответом в виде SSE потока.
@@ -88,27 +120,14 @@ class MCPClient:
     # MCP protocol
 
     def _call(self, method: str, params: Optional[dict] = None) -> Any:
-        """
-        Вызов MCP метода. Пробуем сначала простой JSON POST,
-        затем SSE если сервер отвечает потоком.
-        """
         payload = self._rpc(method, params)
-        endpoint = "/mcp"  # стандартный MCP endpoint
-
+        endpoint = "/mcp"
         try:
             resp = self._post_json(endpoint, payload)
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 405:
-                # Некоторые серверы принимают только SSE
-                resp = self._post_sse(endpoint, payload)
-            else:
-                raise MCPError(f"HTTP {e.response.status_code}: {e.response.text}") from e
+            raise MCPError(f"HTTP {e.response.status_code}: {e.response.text}") from e
         except Exception as e:
-            # Пробуем SSE режим
-            try:
-                resp = self._post_sse(endpoint, payload)
-            except Exception:
-                raise MCPError(f"Cannot connect to MCP server: {e}") from e
+            raise MCPError(f"Cannot connect: {e}") from e
 
         if "error" in resp:
             raise MCPError(f"MCP error: {resp['error']}")
