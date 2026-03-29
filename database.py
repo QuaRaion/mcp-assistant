@@ -21,14 +21,24 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
     description TEXT,
     tools_cache TEXT,          -- JSON список tools (кэш)
     is_active   INTEGER DEFAULT 1,
+    is_builtin  INTEGER DEFAULT 0,
     created_at  TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS chats (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    title        TEXT NOT NULL DEFAULT 'New Chat',
+    server_names TEXT NOT NULL DEFAULT '[]',
+    created_at   TEXT DEFAULT (datetime('now')),
+    updated_at   TEXT DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS chat_messages (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    role       TEXT NOT NULL,   -- ['user'|'assistant'|'system']
+    chat_id    INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    role       TEXT NOT NULL,
     content    TEXT NOT NULL,
-    meta       TEXT,            -- JSON (какие серверы использовались и т.д.)
+    meta       TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
 """
@@ -37,6 +47,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
@@ -47,11 +58,11 @@ def init_db() -> None:
 
 # MCP сервера (CRUD + кэш инструментов):
 
-def add_server(name: str, url: str, api_key: str = "", description: str = "") -> int:
+def add_server(name: str, url: str, api_key: str = "", description: str = "", is_builtin: int = 0) -> int:
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO mcp_servers (name, url, api_key, description) VALUES (?,?,?,?)",
-            (name, url, api_key, description),
+            "INSERT INTO mcp_servers (name, url, api_key, description, is_builtin) VALUES (?,?,?,?,?)",
+            (name, url, api_key, description, is_builtin),
         )
         return cur.lastrowid
 
@@ -78,19 +89,12 @@ def get_servers(active_only: bool = True) -> list[dict]:
     q = "SELECT * FROM mcp_servers"
     if active_only:
         q += " WHERE is_active=1"
-    q += " ORDER BY name"
+    q += " ORDER BY is_builtin DESC, name"
     with get_conn() as conn:
         rows = conn.execute(q).fetchall()
     return [dict(r) for r in rows]
 
-
-def get_server_by_id(server_id: int) -> Optional[dict]:
-    with get_conn() as conn:
-        row = conn.execute("SELECT * FROM mcp_servers WHERE id=?", (server_id,)).fetchone()
-    return dict(row) if row else None
-
-
-def cache_tools(server_id: int, tools: list[dict]) -> None:
+def cache_tools(server_id, tools):
     with get_conn() as conn:
         conn.execute(
             "UPDATE mcp_servers SET tools_cache=? WHERE id=?",
@@ -107,26 +111,92 @@ def get_cached_tools(server_id: int) -> Optional[list[dict]]:
         return json.loads(row["tools_cache"])
     return None
 
+# Чаты (CRUD):
 
-# История сообщений:
-
-def save_message(role: str, content: str, meta: Optional[dict] = None) -> int:
+def create_chat(title="New Chat", server_names: list[str] = None) -> int:
+    names = json.dumps(server_names or [], ensure_ascii=False)
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO chat_messages (role, content, meta) VALUES (?,?,?)",
-            (role, content, json.dumps(meta) if meta else None),
+            "INSERT INTO chats (title, server_names) VALUES (?,?)",
+            (title, names),
         )
         return cur.lastrowid
 
-
-def get_history(limit: int = 50) -> list[dict]:
+def get_chats() -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM chat_messages ORDER BY id DESC LIMIT ?", (limit,)
+            "SELECT * FROM chats ORDER BY updated_at DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+def get_chat(chat_id: int) -> Optional[dict]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM chats WHERE id=?", (chat_id,)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d["server_names"] = json.loads(d["server_names"])
+    return d
+
+def update_chat(chat_id: int, title: str = None, server_names: list[str] = None):
+    fields = {}
+    if title is not None:
+        fields["title"] = title
+    if server_names is not None:
+        fields["server_names"] = json.dumps(server_names, ensure_ascii=False)
+    fields["updated_at"] = "datetime('now')"
+    if not fields:
+        return
+    # updated_at через raw SQL
+    sets = ", ".join(
+        f"{k}=datetime('now')" if k == "updated_at" else f"{k}=?"
+        for k in fields
+    )
+    values = [v for k, v in fields.items() if k != "updated_at"]
+    with get_conn() as conn:
+        conn.execute(f"UPDATE chats SET {sets} WHERE id=?", (*values, chat_id))
+
+def delete_chat(chat_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM chats WHERE id=?", (chat_id,))
+
+# Сообщения в чате:
+
+def save_message(chat_id: int, role: str, content: str, meta: dict = None) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO chat_messages (chat_id, role, content, meta) VALUES (?,?,?,?)",
+            (chat_id, role, content, json.dumps(meta) if meta else None),
+        )
+        # Обновляем updated_at чата
+        conn.execute(
+            "UPDATE chats SET updated_at=datetime('now') WHERE id=?", (chat_id,)
+        )
+        return cur.lastrowid
+
+def get_messages(chat_id: int, limit: int = 5) -> list[dict]:
+    """
+    Возвращает последние N сообщений чата.
+    limit=5 — оптимально: достаточно контекста, не тратим лишние токены.
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM chat_messages
+               WHERE chat_id=?
+               ORDER BY id DESC LIMIT ?""",
+            (chat_id, limit),
         ).fetchall()
     return [dict(r) for r in reversed(rows)]
 
-
-def clear_history() -> None:
+def get_all_messages(chat_id: int) -> list[dict]:
+    """Все сообщения — для отображения в UI."""
     with get_conn() as conn:
-        conn.execute("DELETE FROM chat_messages")
+        rows = conn.execute(
+            "SELECT * FROM chat_messages WHERE chat_id=? ORDER BY id",
+            (chat_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+def clear_messages(chat_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM chat_messages WHERE chat_id=?", (chat_id,))
