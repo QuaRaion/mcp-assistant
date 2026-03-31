@@ -53,7 +53,7 @@ class MCPClient:
         if self.api_key:
             # GitHub требует именно такой формат
             h["Authorization"] = f"Bearer {self.api_key}"
-            h["Github-MCP-Installed-Apps"] = ""  # иногда нужен этот заголовок
+            h["Github-MCP-Installed-Apps"] = ""
         return h
 
     def _next_id(self) -> int:
@@ -75,7 +75,6 @@ class MCPClient:
         content_type = resp.headers.get("content-type", "")
         text = resp.text
 
-        # SSE формат: "event: message\ndata: {...}"
         if "text/event-stream" in content_type or text.startswith("event:"):
             for line in text.split("\n"):
                 line = line.strip()

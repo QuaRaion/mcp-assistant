@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 BUILTIN_SERVER_NAME = "WebSearch"
 
 
-def _ddg_search(query: str, max_results: int = 5) -> str:
+def _ddg_search(query: str, max_results: int = 3) -> str:
     """Поиск через DuckDuckGo, возвращает форматированный текст."""
     try:
         with DDGS() as ddgs:

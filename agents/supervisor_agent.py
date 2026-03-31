@@ -32,19 +32,18 @@ from config import API_KEY, LLM_BASE_URL, LLM_MODEL
 
 logger = logging.getLogger(__name__)
 
-# Максимум сообщений истории передаваемых в LLM — баланс память/токены
-MAX_HISTORY_MESSAGES = 10
-
+# Максимум сообщений истории передаваемых в LLM:
+MAX_HISTORY_MESSAGES = 0
 
 class AssistantState(TypedDict):
     user_query: str
-    history: list[dict]           # последние N сообщений чата
-    allowed_servers: list[str]    # серверы разрешённые в этом чате ([] = все)
+    # history: list[dict] # временно убрал историю из-за токенов, нужно потом реализовать новую логику для экономии токенов
+    allowed_servers: list[str]
     selected_servers: list[str]
     worker_results: Annotated[list[dict], operator.add]
     final_answer: str
     used_servers: list[str]
-    use_direct_llm: bool  # флаг: отвечать напрямую без агентов
+    use_direct_llm: bool
 
 
 class SupervisorAgent:
@@ -277,7 +276,7 @@ JSON array only:"""
              history: list[dict] = None,
              allowed_servers: list[str] = None) -> dict:
         """
-        history        — последние сообщения чата из БД
+        history         — последние сообщения чата из БД
         allowed_servers — серверы разрешённые в этом чате (None = все)
         """
         initial_state: AssistantState = {

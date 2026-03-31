@@ -58,12 +58,12 @@ with st.sidebar:
     st.divider()
 
     # Навигация
-    if st.button("💬 Chats", use_container_width=True,
+    if st.button("💬 Чаты", use_container_width=True,
                  type="primary" if st.session_state.page == "chat" else "secondary"):
         set_page("chat")
         st.rerun()
 
-    if st.button("🔌 Servers", use_container_width=True,
+    if st.button("🔌 MCP сервера", use_container_width=True,
                  type="primary" if st.session_state.page == "servers" else "secondary"):
         set_page("servers")
         st.rerun()
@@ -72,12 +72,11 @@ with st.sidebar:
 
     # Список чатов
     if st.session_state.page == "chat":
-        if st.button("➕ New Chat", use_container_width=True):
-            chat_id = db.create_chat("New Chat", [])
+        if st.button("Создать новый чат", use_container_width=True, type="primary"):
+            chat_id = db.create_chat("Новый чат", [])
             set_page("chat", chat_id)
             st.rerun()
-
-        st.markdown("**Chats:**")
+        st.markdown("## Чаты:")
         chats = db.get_chats()
         for chat in chats:
             col1, col2 = st.columns([4, 1])
@@ -98,25 +97,21 @@ with st.sidebar:
                         st.session_state.active_chat_id = None
                     st.rerun()
 
-    st.divider()
-    st.caption("LangGraph · LangChain · MCP")
-
 
 # PAGE: CHAT
 
 if st.session_state.page == "chat":
-
     if not st.session_state.workers_loaded:
-        with st.spinner("Loading MCP servers..."):
+        with st.spinner("Загрузка MCP серверов..."):
             reload_workers()
-
+            
     # Нет активного чата
     if st.session_state.active_chat_id is None:
-        st.markdown("## 💬 MCP Assistant")
-        st.markdown("Select a chat from the sidebar or create a new one.")
+        st.markdown("## MCP Assistant")
+        st.markdown("Выберите чат в боковой панели или создайте новый")
 
-        if st.button("➕ Create first chat", type="primary"):
-            chat_id = db.create_chat("New Chat", [])
+        if st.button("Создать новый чат", type="primary"):
+            chat_id = db.create_chat("Новый чат", [])
             set_page("chat", chat_id)
             st.rerun()
         st.stop()
@@ -134,15 +129,18 @@ if st.session_state.page == "chat":
     with col1:
         st.markdown(f"## {chat['title']}")
     with col2:
-        show_settings = st.toggle("⚙️ Settings", value=False)
+        if "show_settings" not in st.session_state:
+            st.session_state.show_settings = False
+        if st.button("⚙️ Настройки"):
+            st.session_state.show_settings = not st.session_state.show_settings
 
-    if show_settings:
+    if st.session_state.show_settings:
         with st.container(border=True):
-            st.markdown("### Chat Settings")
+            st.markdown("### Настройки чата")
             col1, col2 = st.columns(2)
 
             with col1:
-                new_title = st.text_input("Chat name", value=chat["title"])
+                new_title = st.text_input("Название чата", value=chat["title"])
 
             with col2:
                 # Список всех доступных серверов
@@ -154,24 +152,24 @@ if st.session_state.page == "chat":
                     current_servers = all_servers
 
                 selected_servers = st.multiselect(
-                    "Active sources",
+                    "Активные MCP сервера",
                     options=all_servers,
                     default=[s for s in current_servers if s in all_servers],
-                    help="Which MCP servers this chat can use. Empty = all.",
+                    help="Какой MCP сервер использовать в этом чате. Пустота = все.",
                 )
 
             col3, col4 = st.columns([1, 1])
             with col3:
-                if st.button("💾 Save settings", type="primary"):
+                if st.button("💾 Сохранить", type="primary"):
                     db.update_chat(
                         chat_id,
                         title=new_title,
                         server_names=selected_servers,
                     )
-                    st.success("Saved!")
+                    st.success("Изменения сохранены!")
                     st.rerun()
             with col4:
-                if st.button("🗑️ Clear messages"):
+                if st.button("🗑️ Очистить чат"):
                     db.clear_messages(chat_id)
                     st.rerun()
 
@@ -181,11 +179,6 @@ if st.session_state.page == "chat":
     chat_servers = chat.get("server_names") or []
     available = get_sup().get_available_server_names()
     active_servers = [s for s in chat_servers if s in available] if chat_servers else available
-
-    if active_servers:
-        st.caption(f"📡 Sources: {', '.join(active_servers)}")
-    else:
-        st.caption("⚠️ No sources active for this chat.")
 
     # Messages
 
@@ -205,7 +198,7 @@ if st.session_state.page == "chat":
 
     # Input
 
-    if prompt := st.chat_input("Ask me anything..."):
+    if prompt := st.chat_input("Задайте вопрос..."):
         # Сохраняем вопрос
         db.save_message(chat_id, "user", prompt)
 
@@ -213,11 +206,11 @@ if st.session_state.page == "chat":
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                # Берём последние 20 сообщений для истории (экономия токенов)
-                history = db.get_messages(chat_id, limit=20)
+            with st.spinner("Ищу информацию..."):
+                # Берём последние 3 сообщений для истории (экономия токенов)
+                history = db.get_messages(chat_id, limit=3)
                 # Убираем последнее (текущий вопрос который только что добавили)
-                history = [m for m in history if m["content"] != prompt or m["role"] != "user"][-20:]
+                history = [m for m in history if m["content"] != prompt or m["role"] != "user"][-3:]
 
                 response = get_sup().chat(
                     user_query=prompt,
@@ -230,12 +223,12 @@ if st.session_state.page == "chat":
 
             st.markdown(answer)
             if used:
-                st.caption(f"📡 Sources used: {', '.join(used)}")
+                st.caption(f"📡 Использованные сервера: {', '.join(used)}")
 
         db.save_message(chat_id, "assistant", answer, meta={"used_servers": used})
 
         # Автоназвание чата по первому сообщению
-        if chat["title"] == "New Chat" and len(messages) == 0:
+        if chat["title"] == "Новый чат" and len(messages) == 0:
             auto_title = prompt[:40] + ("..." if len(prompt) > 40 else "")
             db.update_chat(chat_id, title=auto_title)
 
@@ -245,40 +238,40 @@ if st.session_state.page == "chat":
 # PAGE: SERVERS
 
 elif st.session_state.page == "servers":
-    st.header("🔌 MCP Servers")
+    st.header("🔌 MCP сервера")
 
     # Встроенный WebSearch
     with st.container(border=True):
         col1, col2 = st.columns([4, 1])
         with col1:
-            st.markdown(f"### 🌐 {BUILTIN_SERVER_NAME} *(built-in)*")
-            st.markdown("DuckDuckGo — always available, no setup required.")
+            st.markdown(f"### 🌐 {BUILTIN_SERVER_NAME}")
+            st.markdown("DuckDuckGo — это встроенный MCP сервер для поиска в интернете. Он всегда активен и не требует настройки.")
         with col2:
-            st.success("✅ Active")
+            st.success("Активен")
 
     st.divider()
-    st.subheader("External MCP Servers")
+    st.subheader("Подключенные MCP сервера")
 
-    with st.expander("➕ Add new server", expanded=False):
+    with st.expander("➕ добавить новый", expanded=False):
         with st.form("add_server_form", clear_on_submit=True):
             col1, col2 = st.columns(2)
             with col1:
-                new_name = st.text_input("Name *", placeholder="GitHub, Notion...")
+                new_name = st.text_input("Название*", placeholder="GitHub, Notion...")
             with col2:
-                new_url = st.text_input("MCP Server URL *", placeholder="https://mcp.example.com/mcp")
+                new_url = st.text_input("MCP Server URL*", placeholder="https://mcp.example.com/mcp")
 
             col3, col4 = st.columns(2)
             with col3:
                 new_api_key = st.text_input("API Key", type="password")
             with col4:
-                new_desc = st.text_input("Description")
-            submitted = st.form_submit_button("Connect", type="primary")
+                new_desc = st.text_input("Описание")
+            submitted = st.form_submit_button("Подключиться", type="primary")
 
         if submitted:
             if not new_name or not new_url:
-                st.error("Name and URL required.")
+                st.error("Название и URL обязательны")
             else:
-                with st.spinner(f"Testing connection to {new_name}..."):
+                with st.spinner(f"Тестирование подключения {new_name}..."):
                     client = MCPClient(new_url, new_api_key)
                     ok, message = client.probe()
                 if ok:
@@ -287,23 +280,23 @@ elif st.session_state.page == "servers":
                         tools = client.get_tools_with_schema()
                         if tools:
                             db.cache_tools(sid, tools)
-                        st.success(f"✅ {new_name} connected! {message}")
+                        st.success(f"✅ {new_name} подключено! {message}")
                         reload_workers(force=True)
                         st.rerun()
                     except Exception as e:
                         if "UNIQUE constraint" in str(e):
-                            st.error(f"Server '{new_name}' already exists.")
+                            st.error(f"Сервер '{new_name}' уже существует.")
                         else:
-                            st.error(f"Error: {e}")
+                            st.error(f"Ошибка: {e}")
                 else:
-                    st.error(f"❌ Cannot connect: {message}")
+                    st.error(f"❌ Не удалось подключиться: {message}")
 
     # Server list
 
     servers = db.get_servers(active_only=False)
 
     if not servers:
-        st.info("No external servers added yet.")
+        st.info("Нет подключенных серверов.")
     else:
         for srv in servers:
             is_active = bool(srv["is_active"])
@@ -315,31 +308,31 @@ elif st.session_state.page == "servers":
                 with col1:
                     st.markdown(f"**URL:** `{srv['url']}`")
                     if srv.get("description"):
-                        st.markdown(f"**Description:** {srv['description']}")
-                    st.markdown(f"**API Key:** {'`[set]`' if srv.get('api_key') else '`[not set]`'}")
+                        st.markdown(f"**Описание:** {srv['description']}")
+                    st.markdown(f"**API Key:** {'`[задан]`' if srv.get('api_key') else '`[не задан]`'}")
                     if cached_tools:
-                        st.markdown(f"**Tools ({len(cached_tools)}):**")
+                        st.markdown(f"**Инструменты ({len(cached_tools)}):**")
                         for t in cached_tools:
                             st.markdown(f"  • `{t['name']}` — {t.get('description','')[:80]}")
                 with col2:
-                    if st.button("🔍 Test", key=f"test_{srv['id']}"):
-                        with st.spinner("Testing..."):
+                    if st.button("🔍 Протестировать", key=f"test_{srv['id']}"):
+                        with st.spinner("Тестирование..."):
                             ok, msg = MCPClient(srv["url"], srv.get("api_key","")).probe()
                         st.success(msg) if ok else st.error(msg)
 
-                    toggle = "⏸ Disable" if is_active else "▶ Enable"
+                    toggle = "⏸ Остановить" if is_active else "▶ Включить"
                     if st.button(toggle, key=f"tog_{srv['id']}"):
                         db.update_server(srv["id"], is_active=0 if is_active else 1)
                         reload_workers(force=True)
                         st.rerun()
 
-                    if st.button("🗑️ Delete", key=f"del_{srv['id']}", type="secondary"):
+                    if st.button("🗑️ Удалить", key=f"del_{srv['id']}", type="secondary"):
                         db.delete_server(srv["id"])
                         get_sup()._workers.pop(srv["name"], None)
                         st.rerun()
 
-                    if st.button("🔄 Tools", key=f"ref_{srv['id']}"):
-                        with st.spinner("Fetching..."):
+                    if st.button("🔄 Обновить", key=f"ref_{srv['id']}"):
+                        with st.spinner("Получение данных..."):
                             try:
                                 tools = MCPClient(srv["url"], srv.get("api_key","")).get_tools_with_schema()
                                 db.cache_tools(srv["id"], tools)

@@ -71,6 +71,12 @@ class WorkerAgent:
             f"- {name}: {tool.description}"
             for name, tool in self._tools_map.items()
         ])
+        print(f">>> Tools available: {list(self._tools_map.keys())}")
+        print(f">>> Tools descriptions:")
+        for name, tool in self._tools_map.items():
+            print(f"    {name}: {tool.description[:100]}")
+
+
 
         system = f"""You are working with '{self.server_name}' data source.
 You have these tools available:
