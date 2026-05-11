@@ -36,6 +36,8 @@ def _build_langchain_tool(mcp_client: MCPClient, tool_schema: dict) -> Tool:
 
     def tool_func(input_str: str) -> str:
         try:
+            if not mcp_client._session_id:
+                mcp_client.initialize()
             if input_str.strip().startswith("{"):
                 args = json.loads(input_str)
             else:
@@ -63,36 +65,39 @@ class WorkerAgent:
         self.server_name = server_name
         self.server_id = server_id
         self.tools_summary = tools_summary
-        self._llm = llm.bind(tool_choice="none") if hasattr(llm, "bind") else llm
+        self._llm = llm
         self._tools_map = {t.name: t for t in tools}
+        self._cache = {}
 
     def run(self, task: str) -> str:
         tools_desc = "\n".join([
             f"- {name}: {tool.description}"
             for name, tool in self._tools_map.items()
         ])
-        print(f">>> Tools available: {list(self._tools_map.keys())}")
-        print(f">>> Tools descriptions:")
-        for name, tool in self._tools_map.items():
-            print(f"    {name}: {tool.description[:100]}")
-
-
 
         system = f"""You are working with '{self.server_name}' data source.
 You have these tools available:
 {tools_desc}
 
-IMPORTANT: Do NOT use any built-in tool calling or JSON function calls.
-You MUST respond using ONLY this exact text format:
+IMPORTANT: Do NOT use JSON function calls. Use ONLY this text format:
 
-To use a tool:
 TOOL: tool_name
-INPUT: tool_input
+INPUT: {{"key": "value"}}
 
-When done:
-ANSWER: your final answer
+Or when done:
+ANSWER: your answer
 
-Available tool names: {list(self._tools_map.keys())}
+WORKFLOW FOR GITHUB:
+- To get user info: TOOL: get_me / INPUT: {{}}
+- To list repos after get_me: TOOL: search_repositories / INPUT: {{"query": "user:USERNAME"}}
+  where USERNAME is the login from get_me result
+- To list issues: TOOL: list_issues / INPUT: {{"owner": "USERNAME", "repo": "REPONAME"}}
+- NEVER ask user for their username — always get it from get_me first
+
+CRITICAL: Always pass required parameters. For search_repositories use query="user:LOGIN".
+
+Available tool names: {json.dumps(list(self._tools_map.keys()))}
+Answer in the same language as the user.
 """
 
         messages = [
@@ -100,7 +105,7 @@ Available tool names: {list(self._tools_map.keys())}
             HumanMessage(content=task),
         ]
 
-        for _ in range(2):
+        for _ in range(6):
             response = self._llm.invoke(messages)
             text = response.content.strip()
 
@@ -118,7 +123,22 @@ Available tool names: {list(self._tools_map.keys())}
                     if not tool:
                         tool_result = f"Tool '{tool_name}' not found. Available: {list(self._tools_map.keys())}"
                     else:
-                        tool_result = tool.func(tool_input)
+                        cache_key = f"{tool_name}:{tool_input}"
+                        if cache_key in self._cache:
+                            tool_result = self._cache[cache_key]
+                            logger.info(f"Cache: {tool_name}")
+                        else:
+                            tool_result = tool.func(tool_input)
+                            # Кэшируем только read-only вызовы (не создание/удаление)
+                            CACHEABLE_TOOLS = {"get_me", "list_repositories", "search_repositories", 
+                                            "list_branches", "get_file_contents", "list_issues",
+                                            "list_pull_requests", "get_commit"}
+                            if tool_name in CACHEABLE_TOOLS:
+                                self._cache[cache_key] = tool_result
+                                logger.info(f"Cached: {tool_name}")
+
+                    if len(str(tool_result)) > 2000:
+                        tool_result = str(tool_result)[:2000] + "... [truncated]"
 
                     messages.append(response)
                     messages.append(HumanMessage(content=f"Tool result:\n{tool_result}"))
@@ -141,6 +161,7 @@ class WorkerAgentFactory:
             api_key=API_KEY,
             base_url=LLM_BASE_URL,
             temperature=0,
+            model_kwargs={"tool_choice": "none"},
         )
 
     def create(self, server_info: dict, tools_schema: list[dict]) -> WorkerAgent | None:

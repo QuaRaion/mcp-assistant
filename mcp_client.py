@@ -36,6 +36,7 @@ class MCPClient:
         self.base_url = url.rstrip("/")
         self.api_key = api_key
         self._request_id = 0
+        self._session_id = None
 
     # helpers
 
@@ -51,9 +52,10 @@ class MCPClient:
             "Accept": "application/json, text/event-stream",
         }
         if self.api_key:
-            # GitHub требует именно такой формат
             h["Authorization"] = f"Bearer {self.api_key}"
             h["Github-MCP-Installed-Apps"] = ""
+        if self._session_id:
+            h["Mcp-Session-Id"] = self._session_id
         return h
 
     def _next_id(self) -> int:
@@ -67,11 +69,20 @@ class MCPClient:
             "method": method,
             "params": params or {},
         }
+    
+    def _extract_session_id(self, resp: httpx.Response) -> None:
+        """Извлекает и сохраняет session ID из заголовков ответа."""
+        session_id = resp.headers.get("Mcp-Session-Id")
+        if session_id:
+            self._session_id = session_id
+            logger.info(f"Session ID saved: {session_id}")
+
 
     # low-level transport
 
     def _parse_response(self, resp: httpx.Response) -> dict:
         """Парсит ответ — JSON или SSE формат."""
+        self._extract_session_id(resp)
         content_type = resp.headers.get("content-type", "")
         text = resp.text
 
@@ -106,6 +117,7 @@ class MCPClient:
         url = f"{self.base_url}{endpoint}"
         with httpx.Client(timeout=MCP_REQUEST_TIMEOUT) as client:
             with connect_sse(client, "POST", url, json=payload, headers=self._headers()) as events:
+                self._extract_session_id(events.response)
                 for event in events.iter_sse():
                     if event.data and event.data != "[DONE]":
                         try:

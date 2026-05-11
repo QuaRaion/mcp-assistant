@@ -33,7 +33,7 @@ from config import API_KEY, LLM_BASE_URL, LLM_MODEL
 logger = logging.getLogger(__name__)
 
 # Максимум сообщений истории передаваемых в LLM:
-MAX_HISTORY_MESSAGES = 0
+MAX_HISTORY_MESSAGES = 5
 
 class AssistantState(TypedDict):
     user_query: str
