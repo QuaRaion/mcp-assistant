@@ -7,3 +7,5 @@ agents/__pycache__
 .DS_Store
 agents/.DS_Store
 assistant.db
+assistant_idk.db
+assistant_main.db
