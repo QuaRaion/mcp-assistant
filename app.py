@@ -2,8 +2,8 @@
 Streamlit UI — главный файл приложения.
 
 Страницы:
-  Чат           — основной чат с ассистентом
-  MCP Сервера   — управление MCP серверами (добавить/удалить/тестировать)
+  Чат         — основной чат с ассистентом
+  MCP Сервера — управление MCP серверами
 """
 
 import json
@@ -73,6 +73,7 @@ with st.sidebar:
             chat_id = db.create_chat("Новый чат", [])
             set_page("chat", chat_id)
             st.rerun()
+
         st.markdown("## Чаты:")
         chats = db.get_chats()
         for chat in chats:
@@ -158,7 +159,7 @@ if st.session_state.page == "chat":
                     st.rerun()
             with col4:
                 if st.button("🗑️ Очистить чат"):
-                    db.clear_messages(chat_id)  # также удаляет резюме
+                    db.clear_messages(chat_id)
                     st.rerun()
 
     st.divider()
@@ -168,7 +169,7 @@ if st.session_state.page == "chat":
     available = get_sup().get_available_server_names()
     active_servers = [s for s in chat_servers if s in available] if chat_servers else available
 
-    # --- Отображаем резюме (если есть) ---
+    # --- Резюме диалога ---
     summary_row = db.get_summary(chat_id)
     current_summary = summary_row["summary"] if summary_row else ""
     if current_summary:
@@ -188,6 +189,9 @@ if st.session_state.page == "chat":
                     used = meta.get("used_servers", [])
                     if used:
                         st.caption(f"📡 {', '.join(used)}")
+                    # Показываем иконку уточнения если агент переспросил
+                    if meta.get("needs_clarification"):
+                        st.caption("❓ Требуется уточнение")
                 except Exception:
                     pass
 
@@ -200,14 +204,16 @@ if st.session_state.page == "chat":
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner("Ищу информацию..."):
-                # Загружаем резюме и скользящее окно из БД
+            with st.spinner("Обрабатываю запрос..."):
+                # Загружаем память из БД
                 summary_row = db.get_summary(chat_id)
                 summary = summary_row["summary"] if summary_row else ""
 
-                # Последние RECENT_MESSAGES_WINDOW сообщений (без только что добавленного вопроса)
                 recent = db.get_messages(chat_id, limit=RECENT_MESSAGES_WINDOW + 1)
-                recent = [m for m in recent if not (m["role"] == "user" and m["content"] == prompt)]
+                recent = [
+                    m for m in recent
+                    if not (m["role"] == "user" and m["content"] == prompt)
+                ]
                 recent = recent[-RECENT_MESSAGES_WINDOW:]
 
                 response = get_sup().chat(
@@ -219,22 +225,29 @@ if st.session_state.page == "chat":
 
             answer = response["answer"]
             used = response.get("used_servers", [])
+            needs_clarification = response.get("needs_clarification", False)
 
             st.markdown(answer)
+
+            # Подпись с использованными серверами
             if used:
                 st.caption(f"📡 Использованные сервера: {', '.join(used)}")
+            if needs_clarification:
+                st.caption("❓ Уточните запрос и я продолжу")
 
-        db.save_message(chat_id, "assistant", answer, meta={"used_servers": used})
+        db.save_message(
+            chat_id, "assistant", answer,
+            meta={"used_servers": used, "needs_clarification": needs_clarification},
+        )
 
-        # Автоназвание чата по первому сообщению
+        # Автоназвание чата
         if chat["title"] == "Новый чат" and len(messages) == 0:
             auto_title = prompt[:40] + ("..." if len(prompt) > 40 else "")
             db.update_chat(chat_id, title=auto_title)
 
-        # Обновляем резюме в фоне если накопилось достаточно сообщений
+        # Обновляем резюме в фоновом потоке — не блокирует UI
         if db.should_update_summary(chat_id):
-            with st.spinner("Обновляю память диалога..."):
-                get_sup().update_summary(chat_id)
+            get_sup().update_summary_async(chat_id)
 
         st.rerun()
 
@@ -248,7 +261,7 @@ elif st.session_state.page == "servers":
         col1, col2 = st.columns([4, 1])
         with col1:
             st.markdown(f"### 🌐 {BUILTIN_SERVER_NAME}")
-            st.markdown("DuckDuckGo — встроенный инструмент поиска в интернете. Всегда активен.")
+            st.markdown("DuckDuckGo — встроенный инструмент поиска. Всегда активен.")
         with col2:
             st.success("Активен")
 
@@ -335,7 +348,9 @@ elif st.session_state.page == "servers":
                     if st.button("🔄 Обновить", key=f"ref_{srv['id']}"):
                         with st.spinner("Получение данных..."):
                             try:
-                                tools = MCPClient(srv["url"], srv.get("api_key", "")).get_tools_with_schema()
+                                tools = MCPClient(
+                                    srv["url"], srv.get("api_key", "")
+                                ).get_tools_with_schema()
                                 db.cache_tools(srv["id"], tools)
                                 reload_workers(force=True)
                                 st.success(f"{len(tools)} tools")
