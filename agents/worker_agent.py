@@ -13,6 +13,10 @@ from config import API_KEY, LLM_BASE_URL, LLM_MODEL
 
 logger = logging.getLogger(__name__)
 
+# Максимум итераций ReAct для обычных серверов.
+# Большинство задач решается за 1-2 итерации — лимит 3 страхует от петли.
+MAX_REACT_ITERATIONS = 3
+
 
 def _build_langchain_tool(mcp_client: MCPClient, tool_schema: dict) -> Tool:
     name = tool_schema["name"]
@@ -60,6 +64,58 @@ def _build_langchain_tool(mcp_client: MCPClient, tool_schema: dict) -> Tool:
     return Tool(name=name, description=full_description, func=tool_func)
 
 
+def _build_system_prompt(server_name: str, tools_desc: str, tool_names: list[str]) -> str:
+    """
+    Строит системный промпт для ReAct агента.
+
+    Ключевые принципы для экономии токенов:
+    - Жёсткий формат без отклонений
+    - Пример прямо в промпте — модель сразу понимает что делать
+    - Явный запрет на рассуждения вне формата
+    - Правило «один инструмент за раз»
+    """
+    tools_json = json.dumps(tool_names)
+
+    return f"""You are an agent working with '{server_name}'.
+
+TOOLS:
+{tools_desc}
+
+STRICT FORMAT — use EXACTLY one of these two patterns per response:
+
+Pattern 1 — call a tool:
+TOOL: tool_name
+INPUT: {{"param": "value"}}
+
+Pattern 2 — give final answer:
+ANSWER: your answer here
+
+RULES:
+- One pattern per response, nothing else.
+- NEVER add explanations before TOOL/ANSWER.
+- NEVER call a tool you already called with the same input.
+- If tool result contains the answer — use ANSWER immediately.
+- If task needs no tools — use ANSWER immediately.
+- Available tools: {tools_json}
+- Answer in the same language as the user.
+
+GITHUB SPECIFICS (if applicable):
+- Need username? → TOOL: get_me / INPUT: {{}}  (use login from result for next calls)
+- List repos: TOOL: search_repositories / INPUT: {{"query": "user:LOGIN"}}
+- List issues: TOOL: list_issues / INPUT: {{"owner": "LOGIN", "repo": "REPONAME"}}
+
+EXAMPLE:
+User: list my repos
+Response:
+TOOL: get_me
+INPUT: {{}}
+[tool returns: {{"login": "alice", ...}}]
+TOOL: search_repositories
+INPUT: {{"query": "user:alice"}}
+[tool returns list]
+ANSWER: Your repositories: repo1, repo2, repo3"""
+
+
 class WorkerAgent:
     def __init__(self, server_name: str, server_id: int, llm, tools: list, tools_summary: list[str]):
         self.server_name = server_name
@@ -75,83 +131,88 @@ class WorkerAgent:
             for name, tool in self._tools_map.items()
         ])
 
-        system = f"""You are working with '{self.server_name}' data source.
-You have these tools available:
-{tools_desc}
-
-IMPORTANT: Do NOT use JSON function calls. Use ONLY this text format:
-
-TOOL: tool_name
-INPUT: {{"key": "value"}}
-
-Or when done:
-ANSWER: your answer
-
-WORKFLOW FOR GITHUB:
-- To get user info: TOOL: get_me / INPUT: {{}}
-- To list repos after get_me: TOOL: search_repositories / INPUT: {{"query": "user:USERNAME"}}
-  where USERNAME is the login from get_me result
-- To list issues: TOOL: list_issues / INPUT: {{"owner": "USERNAME", "repo": "REPONAME"}}
-- NEVER ask user for their username — always get it from get_me first
-
-CRITICAL: Always pass required parameters. For search_repositories use query="user:LOGIN".
-
-Available tool names: {json.dumps(list(self._tools_map.keys()))}
-Answer in the same language as the user.
-"""
+        system = _build_system_prompt(
+            self.server_name,
+            tools_desc,
+            list(self._tools_map.keys()),
+        )
 
         messages = [
             SystemMessage(content=system),
             HumanMessage(content=task),
         ]
 
-        for _ in range(6):
+        called_tools: set[str] = set()  # защита от повторных вызовов
+
+        for iteration in range(MAX_REACT_ITERATIONS):
             response = self._llm.invoke(messages)
             text = response.content.strip()
+            logger.info(f"[{self.server_name}] iter={iteration} response={text[:120]}")
 
+            # Финальный ответ
             if "ANSWER:" in text:
                 return text.split("ANSWER:", 1)[1].strip()
 
+            # Вызов инструмента
             if "TOOL:" in text and "INPUT:" in text:
                 try:
-                    tool_line = [l for l in text.split("\n") if l.startswith("TOOL:")][0]
-                    input_line = [l for l in text.split("\n") if l.startswith("INPUT:")][0]
-                    tool_name = tool_line.replace("TOOL:", "").strip()
-                    tool_input = input_line.replace("INPUT:", "").strip()
+                    lines = text.split("\n")
+                    tool_name = next(
+                        l.replace("TOOL:", "").strip() for l in lines if l.startswith("TOOL:")
+                    )
+                    tool_input = next(
+                        l.replace("INPUT:", "").strip() for l in lines if l.startswith("INPUT:")
+                    )
 
                     tool = self._tools_map.get(tool_name)
                     if not tool:
-                        tool_result = f"Tool '{tool_name}' not found. Available: {list(self._tools_map.keys())}"
+                        tool_result = (
+                            f"Tool '{tool_name}' not found. "
+                            f"Available: {list(self._tools_map.keys())}"
+                        )
                     else:
-                        cache_key = f"{tool_name}:{tool_input}"
-                        if cache_key in self._cache:
-                            tool_result = self._cache[cache_key]
-                            logger.info(f"Cache: {tool_name}")
+                        # Защита от дублирующих вызовов
+                        call_key = f"{tool_name}:{tool_input}"
+                        if call_key in called_tools:
+                            tool_result = "You already called this tool with the same input. Use ANSWER now."
+                        elif call_key in self._cache:
+                            tool_result = self._cache[call_key]
+                            logger.info(f"Cache hit: {tool_name}")
                         else:
                             tool_result = tool.func(tool_input)
-                            # Кэшируем только read-only вызовы (не создание/удаление)
-                            CACHEABLE_TOOLS = {"get_me", "list_repositories", "search_repositories", 
-                                            "list_branches", "get_file_contents", "list_issues",
-                                            "list_pull_requests", "get_commit"}
-                            if tool_name in CACHEABLE_TOOLS:
-                                self._cache[cache_key] = tool_result
+                            called_tools.add(call_key)
+                            # Кэшируем read-only вызовы
+                            CACHEABLE = {
+                                "get_me", "list_repositories", "search_repositories",
+                                "list_branches", "get_file_contents", "list_issues",
+                                "list_pull_requests", "get_commit",
+                            }
+                            if tool_name in CACHEABLE:
+                                self._cache[call_key] = tool_result
                                 logger.info(f"Cached: {tool_name}")
 
-                    if len(str(tool_result)) > 2000:
-                        tool_result = str(tool_result)[:2000] + "... [truncated]"
+                    # Обрезаем большие результаты
+                    if len(str(tool_result)) > 5000:
+                        tool_result = str(tool_result)[:5000] + "... [truncated]"
 
                     messages.append(response)
                     messages.append(HumanMessage(content=f"Tool result:\n{tool_result}"))
                     continue
-                except Exception as e:
+
+                except (StopIteration, Exception) as e:
                     messages.append(response)
-                    messages.append(HumanMessage(content=f"Parsing error: {e}. Use exact format: TOOL: name\nINPUT: value"))
+                    messages.append(HumanMessage(
+                        content=f"Parse error: {e}. Use EXACTLY:\nTOOL: name\nINPUT: {{\"key\": \"value\"}}"
+                    ))
                     continue
 
+            # Модель не соблюла формат — жёсткое напоминание
             messages.append(response)
-            messages.append(HumanMessage(content="Please use the exact format: TOOL: tool_name\nINPUT: value\nOr: ANSWER: your answer"))
+            messages.append(HumanMessage(
+                content="FORMAT ERROR. Respond with ONLY:\nTOOL: tool_name\nINPUT: {\"key\": \"value\"}\nOR:\nANSWER: your answer"
+            ))
 
-        return "Could not get result after maximum iterations."
+        return "Could not complete the task within iteration limit."
 
 
 class WorkerAgentFactory:

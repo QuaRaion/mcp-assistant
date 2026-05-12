@@ -6,9 +6,13 @@ Supervisor Agent — главный координатор на основе Lan
 
 Шаги:
   1. route      — LLM анализирует запрос и выбирает релевантные серверы
-  2. workers    — параллельный (или последовательный) запуск Worker Agents
+  2. workers    — запуск Worker Agents (последовательно)
   3. synthesize — LLM синтезирует финальный ответ из результатов workers
   4. direct_llm — если нет релевантных источников, отвечает напрямую
+
+Память:
+  Summary memory = резюме старой истории + скользящее окно последних N сообщений.
+  Резюме хранится в SQLite, пересчитывается каждые SUMMARY_EVERY сообщений.
 """
 
 import json
@@ -27,17 +31,24 @@ from agents.builtin_search import (
     _ddg_search,
 )
 from mcp_client import MCPClient
-from database import get_servers, cache_tools, get_cached_tools
+from database import (
+    get_servers, cache_tools, get_cached_tools,
+    get_summary, save_summary, should_update_summary,
+    get_messages, count_messages,
+)
 from config import API_KEY, LLM_BASE_URL, LLM_MODEL
 
 logger = logging.getLogger(__name__)
 
-# Максимум сообщений истории передаваемых в LLM:
-MAX_HISTORY_MESSAGES = 5
+# Скользящее окно: сколько последних сообщений передавать в LLM вместе с резюме.
+# 6 = 3 пары user/assistant — достаточно для разрешения анафор ("первого", "его").
+RECENT_MESSAGES_WINDOW = 6
+
 
 class AssistantState(TypedDict):
     user_query: str
-    # history: list[dict] # временно убрал историю из-за токенов, нужно потом реализовать новую логику для экономии токенов
+    summary: str            # резюме старой истории (может быть пустым)
+    recent_history: list[dict]  # последние RECENT_MESSAGES_WINDOW сообщений
     allowed_servers: list[str]
     selected_servers: list[str]
     worker_results: Annotated[list[dict], operator.add]
@@ -57,19 +68,17 @@ class SupervisorAgent:
         self.factory = WorkerAgentFactory()
         self._workers: dict[str, WorkerAgent] = {}
         self._graph = self._build_graph()
-        # Встроенный WebSearch всегда загружаем
         self._load_builtin_search()
 
-    # Builtin search
+    # --- Builtin search ---
 
     def _load_builtin_search(self):
-        """Встроенный WebSearch доступен всегда."""
         tool = get_builtin_search_tool()
         worker = self.factory.create_from_lc_tools(BUILTIN_SERVER_NAME, [tool])
         self._workers[BUILTIN_SERVER_NAME] = worker
         logger.info("Built-in WebSearch loaded.")
 
-    # Worker management
+    # --- Worker management ---
 
     def load_workers(self, force_refresh: bool = False) -> dict[str, list[str]]:
         """Загружает MCP серверы из БД. Встроенный WebSearch остаётся всегда."""
@@ -116,27 +125,90 @@ class SupervisorAgent:
             lines.append(f"- {name}: [{tools_str}]")
         return "\n".join(lines)
 
-    def _build_history_messages(self, history: list[dict]) -> list:
-        """
-        Конвертирует историю чата в LangChain messages.
-        Берём последние MAX_HISTORY_MESSAGES для экономии токенов.
-        """
-        messages = []
-        recent = history[-MAX_HISTORY_MESSAGES:] if len(history) > MAX_HISTORY_MESSAGES else history
-        for msg in recent:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role == "user":
-                messages.append(HumanMessage(content=content))
-            elif role == "assistant":
-                messages.append(AIMessage(content=content))
-        return messages
+    # --- Summary memory ---
 
-    # Nodes
+    def _build_context_block(self, summary: str, recent_history: list[dict]) -> str:
+        """
+        Собирает блок контекста для передачи в LLM:
+          [резюме прошлого] + [последние N сообщений].
+        Пустые части пропускаются.
+        """
+        parts = []
+        if summary:
+            parts.append(f"[Conversation summary so far]\n{summary}")
+        if recent_history:
+            lines = []
+            for msg in recent_history:
+                role = "User" if msg["role"] == "user" else "Assistant"
+                lines.append(f"{role}: {msg['content']}")
+            parts.append("[Recent messages]\n" + "\n".join(lines))
+        return "\n\n".join(parts)
+
+    def _build_lc_history(self, recent_history: list[dict]) -> list:
+        """Конвертирует recent_history в LangChain messages."""
+        result = []
+        for msg in recent_history:
+            if msg["role"] == "user":
+                result.append(HumanMessage(content=msg["content"]))
+            elif msg["role"] == "assistant":
+                result.append(AIMessage(content=msg["content"]))
+        return result
+
+    def update_summary(self, chat_id: int) -> str:
+        """
+        Пересчитывает резюме чата через LLM.
+        Вызывается из app.py после сохранения ответа ассистента,
+        когда should_update_summary() возвращает True.
+        Возвращает новое резюме (или старое если не нужно обновлять).
+        """
+        if not should_update_summary(chat_id):
+            existing = get_summary(chat_id)
+            return existing["summary"] if existing else ""
+
+        # Берём все сообщения кроме последних RECENT_MESSAGES_WINDOW —
+        # они уже будут в скользящем окне, резюмировать их не нужно.
+        all_msgs = get_messages(chat_id, limit=200)
+        to_summarize = all_msgs[:-RECENT_MESSAGES_WINDOW] if len(all_msgs) > RECENT_MESSAGES_WINDOW else []
+
+        if not to_summarize:
+            return ""
+
+        # Формируем текст диалога для сжатия
+        dialog_text = "\n".join([
+            f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
+            for m in to_summarize
+        ])
+
+        # Если есть старое резюме — передаём его как контекст
+        old_summary_row = get_summary(chat_id)
+        old_summary = old_summary_row["summary"] if old_summary_row else ""
+
+        prompt_parts = []
+        if old_summary:
+            prompt_parts.append(f"Previous summary:\n{old_summary}\n")
+        prompt_parts.append(
+            f"New conversation fragment:\n{dialog_text}\n\n"
+            "Write a concise summary (3-5 sentences) of the entire conversation above. "
+            "Include: main topics discussed, key facts found (repos, tasks, pages), "
+            "user preferences or context. Be specific, not generic. "
+            "Reply with summary only, no preamble."
+        )
+
+        try:
+            resp = self.llm.invoke([HumanMessage(content="\n".join(prompt_parts))])
+            new_summary = resp.content.strip()
+            total = count_messages(chat_id)
+            save_summary(chat_id, new_summary, total)
+            logger.info(f"Summary updated for chat {chat_id}: {new_summary[:100]}")
+            return new_summary
+        except Exception as e:
+            logger.error(f"Summary update failed: {e}")
+            return old_summary
+
+    # --- Graph nodes ---
 
     def _node_route(self, state: AssistantState) -> dict:
         allowed = state.get("allowed_servers") or list(self._workers.keys())
-        # Фильтруем только существующие
         allowed = [s for s in allowed if s in self._workers]
 
         if not allowed:
@@ -144,20 +216,29 @@ class SupervisorAgent:
 
         summaries = self.get_worker_summaries(allowed)
 
-        system = """You are a routing agent. Select which data sources are relevant for the user query.
-Respond ONLY with a JSON array of source names.
-Rules:
-- Include WebSearch for current events, news, weather, facts, prices.
-- Return [] for purely conversational messages (hi, thanks, jokes).
-- Otherwise pick the most relevant sources."""
+        # Контекст для роутинга — нужен чтобы понять "первого" = repo1
+        context_block = self._build_context_block(
+            state.get("summary", ""),
+            state.get("recent_history", []),
+        )
 
-        user_msg = f"""Query: {state['user_query']}
+        system = (
+            "You are a routing agent. Select which data sources are relevant for the user query.\n"
+            "Respond ONLY with a JSON array of source names.\n"
+            "Rules:\n"
+            "- Include WebSearch for current events, news, weather, facts.\n"
+            "- Return [] for purely conversational messages (hi, thanks, jokes).\n"
+            "- Consider conversation context when query references previous results."
+        )
 
-Sources:
-{summaries}
-
-Choose from: {json.dumps(allowed)}
-JSON array only:"""
+        context_part = f"\nContext:\n{context_block}\n" if context_block else ""
+        user_msg = (
+            f"Query: {state['user_query']}"
+            f"{context_part}\n"
+            f"Sources:\n{summaries}\n\n"
+            f"Choose from: {json.dumps(allowed)}\n"
+            f"JSON array only:"
+        )
 
         try:
             resp = self.llm.invoke([
@@ -183,13 +264,19 @@ JSON array only:"""
         return {"selected_servers": selected, "worker_results": [], "use_direct_llm": False}
 
     def _node_direct_llm(self, state: AssistantState) -> dict:
-        """Прямой ответ с историей чата."""
+        """Прямой ответ LLM с контекстом памяти."""
         messages = [SystemMessage(content=(
             "You are a helpful AI assistant. "
             "Answer in the same language as the user. Be concise."
         ))]
-        # Добавляем историю для контекста
-        messages += self._build_history_messages(state.get("history", []))
+
+        # Добавляем резюме как системный контекст
+        summary = state.get("summary", "")
+        if summary:
+            messages.append(SystemMessage(content=f"Conversation context:\n{summary}"))
+
+        # Скользящее окно истории
+        messages += self._build_lc_history(state.get("recent_history", []))
         messages.append(HumanMessage(content=state["user_query"]))
 
         try:
@@ -202,21 +289,34 @@ JSON array only:"""
         BUILTIN_MAP = {BUILTIN_SERVER_NAME: _ddg_search}
         results = []
 
+        # Передаём контекст воркерам через расширенный запрос
+        context_block = self._build_context_block(
+            state.get("summary", ""),
+            state.get("recent_history", []),
+        )
+        enriched_query = state["user_query"]
+        if context_block:
+            enriched_query = (
+                f"{context_block}\n\n"
+                f"Current request: {state['user_query']}"
+            )
+
         for server_name in state["selected_servers"]:
-            logger.info(f"Running: {server_name}")
+            logger.info(f"Running worker: {server_name}")
 
             if server_name in BUILTIN_MAP:
+                # WebSearch — передаём только оригинальный запрос
                 result = BUILTIN_MAP[server_name](state["user_query"])
-                logger.info(f"Built-in result: {result[:200]}")
             else:
                 worker = self._workers.get(server_name)
                 if not worker:
                     logger.warning(f"Worker not found: {server_name}")
                     result = f"⚠️ Server '{server_name}' not connected."
                 else:
-                    result = worker.run(state["user_query"])
-                    logger.info(f"MCP result: {result[:200]}")
+                    # MCP воркер получает запрос с контекстом
+                    result = worker.run(enriched_query)
 
+            logger.info(f"[{server_name}] result preview: {str(result)[:200]}")
             results.append({"server": server_name, "result": result})
 
         return {"worker_results": results}
@@ -227,6 +327,17 @@ JSON array only:"""
         if not worker_results:
             return self._node_direct_llm(state)
 
+        # Если один источник и результат выглядит как готовый ответ — пропускаем LLM
+        if len(worker_results) == 1:
+            single = worker_results[0]["result"]
+            # Если воркер уже дал развёрнутый ответ (>100 символов) — отдаём напрямую
+            if isinstance(single, str) and len(single) > 100:
+                logger.info("Single worker result — skipping synthesize LLM call.")
+                return {
+                    "final_answer": single,
+                    "used_servers": [worker_results[0]["server"]],
+                }
+
         results_text = ""
         used = []
         for item in worker_results:
@@ -235,13 +346,20 @@ JSON array only:"""
 
         messages = [SystemMessage(content=(
             "You are a synthesis agent. Combine data from sources into a coherent answer. "
-            "Answer in the same language as the user. Mention URLs when relevant."
+            "Answer in the same language as the user. Mention URLs when relevant. Be concise."
         ))]
-        # История для контекста (урезанная — экономим токены)
-        messages += self._build_history_messages(state.get("history", []))[-4:]
+
+        # Резюме как контекст
+        summary = state.get("summary", "")
+        if summary:
+            messages.append(SystemMessage(content=f"Conversation context:\n{summary}"))
+
+        # Последние 2 пары из скользящего окна (экономим токены)
+        messages += self._build_lc_history(state.get("recent_history", [])[-4:])
+
         messages.append(HumanMessage(content=(
             f"Question: {state['user_query']}\n\n"
-            f"Data:\n{results_text}\n\n"
+            f"Data from sources:\n{results_text}\n\n"
             f"Answer:"
         )))
 
@@ -272,16 +390,22 @@ JSON array only:"""
         graph.add_edge("synthesize", END)
         return graph.compile()
 
-    def chat(self, user_query: str,
-             history: list[dict] = None,
-             allowed_servers: list[str] = None) -> dict:
+    def chat(
+        self,
+        user_query: str,
+        summary: str = "",
+        recent_history: list[dict] = None,
+        allowed_servers: list[str] = None,
+    ) -> dict:
         """
-        history         — последние сообщения чата из БД
+        summary        — резюме старой истории (из БД)
+        recent_history — последние RECENT_MESSAGES_WINDOW сообщений (из БД)
         allowed_servers — серверы разрешённые в этом чате (None = все)
         """
         initial_state: AssistantState = {
             "user_query": user_query,
-            "history": history or [],
+            "summary": summary,
+            "recent_history": recent_history or [],
             "allowed_servers": allowed_servers or [],
             "selected_servers": [],
             "worker_results": [],

@@ -4,7 +4,6 @@ Streamlit UI — главный файл приложения.
 Страницы:
   Чат           — основной чат с ассистентом
   MCP Сервера   — управление MCP серверами (добавить/удалить/тестировать)
-  История       — история диалогов
 """
 
 import json
@@ -13,7 +12,7 @@ import streamlit as st
 
 import database as db
 from mcp_client import MCPClient
-from agents.supervisor_agent import SupervisorAgent
+from agents.supervisor_agent import SupervisorAgent, RECENT_MESSAGES_WINDOW
 from agents.builtin_search import BUILTIN_SERVER_NAME
 
 logging.basicConfig(level=logging.INFO)
@@ -50,14 +49,13 @@ def set_page(page: str, chat_id: int = None):
         st.session_state.active_chat_id = chat_id
 
 
-# Sidebar
+# --- Sidebar ---
 
 with st.sidebar:
     st.title("Интеллектуальный ассистент")
     st.caption("ИИ ассистент с интеграцией MCP")
     st.divider()
 
-    # Навигация
     if st.button("💬 Чаты", use_container_width=True,
                  type="primary" if st.session_state.page == "chat" else "secondary"):
         set_page("chat")
@@ -70,7 +68,6 @@ with st.sidebar:
 
     st.divider()
 
-    # Список чатов
     if st.session_state.page == "chat":
         if st.button("Создать новый чат", use_container_width=True, type="primary"):
             chat_id = db.create_chat("Новый чат", [])
@@ -98,18 +95,16 @@ with st.sidebar:
                     st.rerun()
 
 
-# PAGE: CHAT
+# --- PAGE: CHAT ---
 
 if st.session_state.page == "chat":
     if not st.session_state.workers_loaded:
         with st.spinner("Загрузка MCP серверов..."):
             reload_workers()
-            
-    # Нет активного чата
+
     if st.session_state.active_chat_id is None:
         st.markdown("## MCP Assistant")
         st.markdown("Выберите чат в боковой панели или создайте новый")
-
         if st.button("Создать новый чат", type="primary"):
             chat_id = db.create_chat("Новый чат", [])
             set_page("chat", chat_id)
@@ -123,7 +118,7 @@ if st.session_state.page == "chat":
         st.session_state.active_chat_id = None
         st.rerun()
 
-    # Header + Settings
+    # --- Header + Settings ---
 
     col1, col2 = st.columns([5, 1])
     with col1:
@@ -143,11 +138,8 @@ if st.session_state.page == "chat":
                 new_title = st.text_input("Название чата", value=chat["title"])
 
             with col2:
-                # Список всех доступных серверов
                 all_servers = get_sup().get_available_server_names()
                 current_servers = chat.get("server_names") or []
-
-                # Если пусто — используем все
                 if not current_servers:
                     current_servers = all_servers
 
@@ -155,22 +147,18 @@ if st.session_state.page == "chat":
                     "Активные MCP сервера",
                     options=all_servers,
                     default=[s for s in current_servers if s in all_servers],
-                    help="Какой MCP сервер использовать в этом чате. Пустота = все.",
+                    help="Какие MCP серверы использовать в этом чате. Пустота = все.",
                 )
 
             col3, col4 = st.columns([1, 1])
             with col3:
                 if st.button("💾 Сохранить", type="primary"):
-                    db.update_chat(
-                        chat_id,
-                        title=new_title,
-                        server_names=selected_servers,
-                    )
+                    db.update_chat(chat_id, title=new_title, server_names=selected_servers)
                     st.success("Изменения сохранены!")
                     st.rerun()
             with col4:
                 if st.button("🗑️ Очистить чат"):
-                    db.clear_messages(chat_id)
+                    db.clear_messages(chat_id)  # также удаляет резюме
                     st.rerun()
 
     st.divider()
@@ -180,7 +168,14 @@ if st.session_state.page == "chat":
     available = get_sup().get_available_server_names()
     active_servers = [s for s in chat_servers if s in available] if chat_servers else available
 
-    # Messages
+    # --- Отображаем резюме (если есть) ---
+    summary_row = db.get_summary(chat_id)
+    current_summary = summary_row["summary"] if summary_row else ""
+    if current_summary:
+        with st.expander("🧠 Резюме диалога", expanded=False):
+            st.caption(current_summary)
+
+    # --- Сообщения ---
 
     messages = db.get_all_messages(chat_id)
 
@@ -196,10 +191,9 @@ if st.session_state.page == "chat":
                 except Exception:
                     pass
 
-    # Input
+    # --- Ввод ---
 
     if prompt := st.chat_input("Задайте вопрос..."):
-        # Сохраняем вопрос
         db.save_message(chat_id, "user", prompt)
 
         with st.chat_message("user"):
@@ -207,14 +201,19 @@ if st.session_state.page == "chat":
 
         with st.chat_message("assistant"):
             with st.spinner("Ищу информацию..."):
-                # Берём последние 3 сообщений для истории (экономия токенов)
-                history = db.get_messages(chat_id, limit=3)
-                # Убираем последнее (текущий вопрос который только что добавили)
-                history = [m for m in history if m["content"] != prompt or m["role"] != "user"][-3:]
+                # Загружаем резюме и скользящее окно из БД
+                summary_row = db.get_summary(chat_id)
+                summary = summary_row["summary"] if summary_row else ""
+
+                # Последние RECENT_MESSAGES_WINDOW сообщений (без только что добавленного вопроса)
+                recent = db.get_messages(chat_id, limit=RECENT_MESSAGES_WINDOW + 1)
+                recent = [m for m in recent if not (m["role"] == "user" and m["content"] == prompt)]
+                recent = recent[-RECENT_MESSAGES_WINDOW:]
 
                 response = get_sup().chat(
                     user_query=prompt,
-                    history=history,
+                    summary=summary,
+                    recent_history=recent,
                     allowed_servers=active_servers if chat_servers else None,
                 )
 
@@ -232,27 +231,31 @@ if st.session_state.page == "chat":
             auto_title = prompt[:40] + ("..." if len(prompt) > 40 else "")
             db.update_chat(chat_id, title=auto_title)
 
+        # Обновляем резюме в фоне если накопилось достаточно сообщений
+        if db.should_update_summary(chat_id):
+            with st.spinner("Обновляю память диалога..."):
+                get_sup().update_summary(chat_id)
+
         st.rerun()
 
 
-# PAGE: SERVERS
+# --- PAGE: SERVERS ---
 
 elif st.session_state.page == "servers":
     st.header("🔌 MCP сервера")
 
-    # Встроенный WebSearch
     with st.container(border=True):
         col1, col2 = st.columns([4, 1])
         with col1:
             st.markdown(f"### 🌐 {BUILTIN_SERVER_NAME}")
-            st.markdown("DuckDuckGo — это встроенный MCP сервер для поиска в интернете. Он всегда активен и не требует настройки.")
+            st.markdown("DuckDuckGo — встроенный инструмент поиска в интернете. Всегда активен.")
         with col2:
             st.success("Активен")
 
     st.divider()
     st.subheader("Подключенные MCP сервера")
 
-    with st.expander("➕ добавить новый", expanded=False):
+    with st.expander("➕ Добавить новый", expanded=False):
         with st.form("add_server_form", clear_on_submit=True):
             col1, col2 = st.columns(2)
             with col1:
@@ -291,8 +294,6 @@ elif st.session_state.page == "servers":
                 else:
                     st.error(f"❌ Не удалось подключиться: {message}")
 
-    # Server list
-
     servers = db.get_servers(active_only=False)
 
     if not servers:
@@ -313,11 +314,11 @@ elif st.session_state.page == "servers":
                     if cached_tools:
                         st.markdown(f"**Инструменты ({len(cached_tools)}):**")
                         for t in cached_tools:
-                            st.markdown(f"  • `{t['name']}` — {t.get('description','')[:80]}")
+                            st.markdown(f"  • `{t['name']}` — {t.get('description', '')[:80]}")
                 with col2:
                     if st.button("🔍 Протестировать", key=f"test_{srv['id']}"):
                         with st.spinner("Тестирование..."):
-                            ok, msg = MCPClient(srv["url"], srv.get("api_key","")).probe()
+                            ok, msg = MCPClient(srv["url"], srv.get("api_key", "")).probe()
                         st.success(msg) if ok else st.error(msg)
 
                     toggle = "⏸ Остановить" if is_active else "▶ Включить"
@@ -334,7 +335,7 @@ elif st.session_state.page == "servers":
                     if st.button("🔄 Обновить", key=f"ref_{srv['id']}"):
                         with st.spinner("Получение данных..."):
                             try:
-                                tools = MCPClient(srv["url"], srv.get("api_key","")).get_tools_with_schema()
+                                tools = MCPClient(srv["url"], srv.get("api_key", "")).get_tools_with_schema()
                                 db.cache_tools(srv["id"], tools)
                                 reload_workers(force=True)
                                 st.success(f"{len(tools)} tools")

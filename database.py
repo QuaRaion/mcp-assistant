@@ -1,7 +1,9 @@
 """
 SQLite хранилище:
-  - mcp_servers   — зарегистрированные MCP серверы пользователя
-  - chat_messages — история диалога
+  - mcp_servers    — зарегистрированные MCP серверы пользователя
+  - chats          — чаты с настройками
+  - chat_messages  — история диалога
+  - chat_summaries — сжатые резюме истории (summary memory)
 """
 
 import sqlite3
@@ -10,8 +12,6 @@ from typing import Optional
 from config import DATABASE_PATH
 
 
-# Схема БД:
-
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS mcp_servers (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
     url         TEXT NOT NULL,
     api_key     TEXT,
     description TEXT,
-    tools_cache TEXT,          -- JSON список tools (кэш)
+    tools_cache TEXT,
     is_active   INTEGER DEFAULT 1,
     is_builtin  INTEGER DEFAULT 0,
     created_at  TEXT DEFAULT (datetime('now'))
@@ -40,6 +40,14 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     content    TEXT NOT NULL,
     meta       TEXT,
     created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS chat_summaries (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id         INTEGER NOT NULL UNIQUE REFERENCES chats(id) ON DELETE CASCADE,
+    summary         TEXT NOT NULL,
+    messages_count  INTEGER NOT NULL DEFAULT 0,
+    updated_at      TEXT DEFAULT (datetime('now'))
 );
 """
 
@@ -94,7 +102,8 @@ def get_servers(active_only: bool = True) -> list[dict]:
         rows = conn.execute(q).fetchall()
     return [dict(r) for r in rows]
 
-def cache_tools(server_id, tools):
+
+def cache_tools(server_id: int, tools: list) -> None:
     with get_conn() as conn:
         conn.execute(
             "UPDATE mcp_servers SET tools_cache=? WHERE id=?",
@@ -111,9 +120,10 @@ def get_cached_tools(server_id: int) -> Optional[list[dict]]:
         return json.loads(row["tools_cache"])
     return None
 
+
 # Чаты (CRUD):
 
-def create_chat(title="New Chat", server_names: list[str] = None) -> int:
+def create_chat(title: str = "New Chat", server_names: list[str] = None) -> int:
     names = json.dumps(server_names or [], ensure_ascii=False)
     with get_conn() as conn:
         cur = conn.execute(
@@ -122,12 +132,14 @@ def create_chat(title="New Chat", server_names: list[str] = None) -> int:
         )
         return cur.lastrowid
 
+
 def get_chats() -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT * FROM chats ORDER BY updated_at DESC"
         ).fetchall()
     return [dict(r) for r in rows]
+
 
 def get_chat(chat_id: int) -> Optional[dict]:
     with get_conn() as conn:
@@ -138,27 +150,28 @@ def get_chat(chat_id: int) -> Optional[dict]:
     d["server_names"] = json.loads(d["server_names"])
     return d
 
-def update_chat(chat_id: int, title: str = None, server_names: list[str] = None):
+
+def update_chat(chat_id: int, title: str = None, server_names: list[str] = None) -> None:
     fields = {}
     if title is not None:
         fields["title"] = title
     if server_names is not None:
         fields["server_names"] = json.dumps(server_names, ensure_ascii=False)
-    fields["updated_at"] = "datetime('now')"
     if not fields:
         return
-    # updated_at через raw SQL
-    sets = ", ".join(
-        f"{k}=datetime('now')" if k == "updated_at" else f"{k}=?"
-        for k in fields
-    )
-    values = [v for k, v in fields.items() if k != "updated_at"]
+    sets = ", ".join(f"{k}=?" for k in fields)
+    sets += ", updated_at=datetime('now')"
     with get_conn() as conn:
-        conn.execute(f"UPDATE chats SET {sets} WHERE id=?", (*values, chat_id))
+        conn.execute(
+            f"UPDATE chats SET {sets} WHERE id=?",
+            (*fields.values(), chat_id),
+        )
 
-def delete_chat(chat_id: int):
+
+def delete_chat(chat_id: int) -> None:
     with get_conn() as conn:
         conn.execute("DELETE FROM chats WHERE id=?", (chat_id,))
+
 
 # Сообщения в чате:
 
@@ -168,16 +181,16 @@ def save_message(chat_id: int, role: str, content: str, meta: dict = None) -> in
             "INSERT INTO chat_messages (chat_id, role, content, meta) VALUES (?,?,?,?)",
             (chat_id, role, content, json.dumps(meta) if meta else None),
         )
-        # Обновляем updated_at чата
         conn.execute(
             "UPDATE chats SET updated_at=datetime('now') WHERE id=?", (chat_id,)
         )
         return cur.lastrowid
 
-def get_messages(chat_id: int, limit: int = 5) -> list[dict]:
+
+def get_messages(chat_id: int, limit: int = 6) -> list[dict]:
     """
-    Возвращает последние N сообщений чата.
-    limit=5 — оптимально: достаточно контекста, не тратим лишние токены.
+    Возвращает последние N сообщений чата (по умолчанию 6 = 3 пары user/assistant).
+    Используется для передачи скользящего окна в LLM.
     """
     with get_conn() as conn:
         rows = conn.execute(
@@ -188,6 +201,7 @@ def get_messages(chat_id: int, limit: int = 5) -> list[dict]:
         ).fetchall()
     return [dict(r) for r in reversed(rows)]
 
+
 def get_all_messages(chat_id: int) -> list[dict]:
     """Все сообщения — для отображения в UI."""
     with get_conn() as conn:
@@ -197,6 +211,67 @@ def get_all_messages(chat_id: int) -> list[dict]:
         ).fetchall()
     return [dict(r) for r in rows]
 
-def clear_messages(chat_id: int):
+
+def count_messages(chat_id: int) -> int:
+    """Общее количество сообщений в чате."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM chat_messages WHERE chat_id=?",
+            (chat_id,),
+        ).fetchone()
+    return row["cnt"] if row else 0
+
+
+def clear_messages(chat_id: int) -> None:
     with get_conn() as conn:
         conn.execute("DELETE FROM chat_messages WHERE chat_id=?", (chat_id,))
+    # Удаляем резюме тоже — контекст сброшен
+    clear_summary(chat_id)
+
+
+# Summary memory:
+
+# После каждых SUMMARY_EVERY новых сообщений пересчитываем резюме.
+# 10 = 5 пар user/assistant — достаточно контекста, не слишком часто.
+SUMMARY_EVERY = 10
+
+
+def get_summary(chat_id: int) -> Optional[str]:
+    """Возвращает текущее резюме чата или None."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT summary, messages_count FROM chat_summaries WHERE chat_id=?",
+            (chat_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def save_summary(chat_id: int, summary: str, messages_count: int) -> None:
+    """Сохраняет/обновляет резюме чата (UPSERT)."""
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO chat_summaries (chat_id, summary, messages_count)
+               VALUES (?, ?, ?)
+               ON CONFLICT(chat_id) DO UPDATE SET
+                 summary=excluded.summary,
+                 messages_count=excluded.messages_count,
+                 updated_at=datetime('now')""",
+            (chat_id, summary, messages_count),
+        )
+
+
+def clear_summary(chat_id: int) -> None:
+    """Удаляет резюме чата (при очистке истории)."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM chat_summaries WHERE chat_id=?", (chat_id,))
+
+
+def should_update_summary(chat_id: int) -> bool:
+    """
+    Проверяет, нужно ли пересчитать резюме.
+    True если новых сообщений накопилось >= SUMMARY_EVERY с момента последнего резюме.
+    """
+    total = count_messages(chat_id)
+    summary_row = get_summary(chat_id)
+    last_count = summary_row["messages_count"] if summary_row else 0
+    return (total - last_count) >= SUMMARY_EVERY
