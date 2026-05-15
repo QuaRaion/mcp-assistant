@@ -7,6 +7,7 @@ import logging
 from typing import Optional
 import database as db
 from agents.supervisor_agent import SupervisorAgent, RECENT_MESSAGES_WINDOW
+from langchain_core.messages import HumanMessage, SystemMessage
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,7 @@ def clear_chat(chat_id: int, user_id: int) -> bool:
     return True
 
 
-def update_chat_settings(chat_id: int, user_id: int, title: str = None, server_names: list = None) -> bool:
+def update_chat_settings(chat_id: int, user_id: int, title: Optional[str] = None, server_names: Optional[list] = None) -> bool:
     if not db.get_chat_safe(chat_id, user_id):
         return False
     db.update_chat(chat_id, title=title, server_names=server_names)
@@ -87,10 +88,23 @@ def process_message(user_id: int, chat_id: int, text: str) -> dict:
         return {"answer": "Чат не найден.", "used_servers": [], "needs_clarification": False, "chat_id": chat_id}
 
     db.save_message(chat_id, "user", text)
-
+ 
+    # генерация заголовка чатов через LLM, но может работать медленнее, чем просто обрезка текста:
     if chat["title"] == "Новый чат" and db.count_messages(chat_id) == 1:
-        db.update_chat(chat_id, title=text[:40] + ("..." if len(text) > 40 else ""))
-
+        try:
+            title_resp = get_supervisor(user_id).llm.invoke([
+                SystemMessage(content="Generate a very short chat title (3-5 words max) based on the user's question. No quotes, no punctuation at the end. Reply with title only."),
+                HumanMessage(content=text),
+            ])
+            title = title_resp.content.strip()[:50]
+        except Exception:
+            title = text[:40] + ("..." if len(text) > 40 else "")
+        db.update_chat(chat_id, title=title)
+    
+    # заголовок - просто обрезка первого запроса пользователя:
+    # if chat["title"] == "Новый чат" and db.count_messages(chat_id) == 1:
+    #     db.update_chat(chat_id, title=text[:40] + ("..." if len(text) > 40 else ""))
+   
     summary_row = db.get_summary(chat_id)
     summary = summary_row["summary"] if summary_row else ""
 
