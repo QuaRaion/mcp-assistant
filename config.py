@@ -11,6 +11,9 @@ LLM_MODEL = os.getenv("LLM_MODEL")
 # SQLite
 DATABASE_PATH = os.getenv("DATABASE_PATH", "assistant.db")
 
+# Telegram
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+
 # Timeouts (секунды)
 MCP_CONNECT_TIMEOUT = 10
 MCP_REQUEST_TIMEOUT = 30

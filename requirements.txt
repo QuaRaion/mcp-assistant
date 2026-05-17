@@ -28,3 +28,4 @@ xxhash==3.6.0
 yarl==1.23.0
 zstandard==0.25.0
 ddgs==9.11.4
+python-telegram-bot==21.9
