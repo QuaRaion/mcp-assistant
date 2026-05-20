@@ -1,17 +1,20 @@
-"""Telegram адаптер с приватными MCP серверами."""
+"""Telegram адаптер с inline-кнопками."""
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import logging, asyncio
-from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, MessageHandler, ConversationHandler, filters, ContextTypes
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ConversationHandler,
+    CallbackQueryHandler, filters, ContextTypes,
+)
 from telegram.constants import ParseMode, ChatAction
 
 import database as db
 from mcp_client import MCPClient
 from core.assistant import (
-    process_message, create_new_chat, list_chats, get_chat, clear_chat,
+    process_message, create_new_chat, list_chats, get_chat,
     get_available_servers, reload_workers, invalidate_supervisor,
 )
 from config import TELEGRAM_TOKEN
@@ -21,8 +24,10 @@ logger = logging.getLogger(__name__)
 
 TG_MAX_LENGTH = 4000
 ADD_NAME, ADD_URL, ADD_APIKEY = range(3)
-REMOVE_PICK = 10  # отдельная константа чтобы не конфликтовала с ADD_*
+REMOVE_PICK = 10
 
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _split(text):
     if len(text) <= TG_MAX_LENGTH:
@@ -58,197 +63,322 @@ def _get_active_chat(tg_user):
     return chat
 
 
-# ── Basic commands ────────────────────────────────────────────────────────────
+def _main_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("➕ Новый чат", callback_data="newchat"),
+            InlineKeyboardButton("📚 Мои чаты", callback_data="history"),
+        ],
+        [
+            InlineKeyboardButton("🔌 MCP серверы", callback_data="servers"),
+            InlineKeyboardButton("❓ Помощь", callback_data="help"),
+        ],
+    ])
+
+
+# ── /start ────────────────────────────────────────────────────────────────────
 
 async def cmd_start(update, context):
     tg_user = _get_tg_user(update)
     chat = _get_active_chat(tg_user)
+    name = tg_user.get("first_name") or "там"
     await update.message.reply_text(
-        f"Привет, {tg_user.get('first_name') or 'там'}! 👋\n\n"
-        f"Я MCP Assistant. Текущий чат: *{_esc(chat['title'])}*\n\n"
-        f"/newchat /history /servers /addserver /help",
-        parse_mode=ParseMode.MARKDOWN)
+        f"Привет, {name}\\! 👋\n\n"
+        f"Я MCP Assistant — умный ассистент с доступом к вашим сервисам\\.\n\n"
+        f"Активный чат: *{_esc(chat['title'])}*\n\n"
+        f"Просто напишите вопрос или выберите действие:",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_main_menu_keyboard(),
+    )
 
-async def cmd_help(update, context):
-    await update.message.reply_text(
-        "📋 *Команды:*\n\n"
-        "*Чаты:* /newchat /history /switch N /clear\n"
-        "*Серверы:* /servers /addserver /removeserver\n"
-        "/help — справка", parse_mode=ParseMode.MARKDOWN)
 
-async def cmd_newchat(update, context):
-    tg_user = _get_tg_user(update)
-    chat = create_new_chat(tg_user["user_id"], "Новый чат")
-    db.set_telegram_active_chat(tg_user["telegram_id"], chat["id"])
-    await update.message.reply_text("✅ Новый чат создан. Старая история сохранена — /history")
-
-async def cmd_history(update, context):
-    tg_user = _get_tg_user(update)
-    chats = list_chats(tg_user["user_id"])
-    if not chats:
-        await update.message.reply_text("Нет чатов."); return
-    active_id = tg_user.get("active_chat_id")
-    lines = ["📚 *Ваши чаты:*\n"] + [
-        f"{i}. {'▶ ' if c['id']==active_id else ''}*{_esc(c['title'])}*"
-        for i, c in enumerate(chats[:5], 1)
-    ] + ["\n/switch N — переключить"]
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_switch(update, context):
-    tg_user = _get_tg_user(update)
-    chats = list_chats(tg_user["user_id"])
-    try:
-        n = int(context.args[0])
-        assert 1 <= n <= len(chats)
-    except Exception:
-        await update.message.reply_text(f"Укажите число от 1 до {len(chats)}. Пример: /switch 2"); return
-    chat = chats[n-1]
-    db.set_telegram_active_chat(tg_user["telegram_id"], chat["id"])
-    await update.message.reply_text(f"✅ Переключились на: *{_esc(chat['title'])}*", parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_clear(update, context):
+async def cmd_menu(update, context):
     tg_user = _get_tg_user(update)
     chat = _get_active_chat(tg_user)
-    clear_chat(chat["id"], tg_user["user_id"])
-    await update.message.reply_text(f"🗑️ История *{_esc(chat['title'])}* очищена.", parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_servers(update, context):
-    tg_user = _get_tg_user(update)
-    servers = db.get_servers(tg_user["user_id"], active_only=False)
-    if not servers:
-        await update.message.reply_text("Нет серверов.\n/addserver — добавить"); return
-    lines = ["🔌 *Ваши MCP серверы:*\n"]
-    for srv in servers:
-        cached = db.get_cached_tools(srv["id"]) or []
-        lines.append(f"{'🟢' if srv['is_active'] else '🔴'} *{_esc(srv['name'])}*\n"
-                     f"   `{srv['url']}`\n   {len(cached)} инструментов")
-    lines.append("\n/addserver — добавить\n/removeserver — удалить")
-    await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
-
-# ── /addserver conversation ───────────────────────────────────────────────────
-
-async def addserver_start(update, context):
-    context.user_data.clear()
     await update.message.reply_text(
-        "🔌 *Добавление MCP сервера*\n\nШаг 1/3: Введите название\n_(GitHub, Notion...)_\n\n/cancel — отмена",
-        parse_mode=ParseMode.MARKDOWN)
-    return ADD_NAME
+        f"Активный чат: *{_esc(chat['title'])}*\nВыберите действие:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_main_menu_keyboard(),
+    )
 
-async def addserver_name(update, context):
-    name = update.message.text.strip()
-    if not name:
-        await update.message.reply_text("Название не может быть пустым:"); return ADD_NAME
+
+# ── Callback handler ──────────────────────────────────────────────────────────
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
     tg_user = _get_tg_user(update)
-    existing = db.get_servers(tg_user["user_id"], active_only=False)
-    if any(s["name"].lower() == name.lower() for s in existing):
-        await update.message.reply_text(f"❌ Сервер *{_esc(name)}* уже существует. Другое название:",
-                                        parse_mode=ParseMode.MARKDOWN); return ADD_NAME
-    context.user_data["name"] = name
-    await update.message.reply_text(
-        f"✅ Название: *{_esc(name)}*\n\nШаг 2/3: Введите URL\n_(http://localhost:8000/mcp)_\n\n/cancel",
-        parse_mode=ParseMode.MARKDOWN)
-    return ADD_URL
 
-async def addserver_url(update, context):
-    url = update.message.text.strip()
-    if not url.startswith(("http://", "https://")):
-        await update.message.reply_text("❌ URL должен начинаться с http:// или https://\nПовторите:"); return ADD_URL
-    context.user_data["url"] = url
-    await update.message.reply_text(
-        f"✅ URL: `{url}`\n\nШаг 3/3: Введите API Key\n_(или `-` если не нужен)_\n\n/cancel",
-        parse_mode=ParseMode.MARKDOWN)
-    return ADD_APIKEY
+    # ── Новый чат
+    if data == "newchat":
+        chat = create_new_chat(tg_user["user_id"], "Новый чат")
+        db.set_telegram_active_chat(tg_user["telegram_id"], chat["id"])
+        await query.edit_message_text(
+            "✅ Новый чат создан\\. Просто напишите сообщение\\!",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("‹ Меню", callback_data="menu")
+            ]])
+        )
 
-async def addserver_apikey(update, context):
-    raw = update.message.text.strip()
-    api_key = "" if raw == "-" else raw
-    name = context.user_data["name"]
-    url = context.user_data["url"]
+    # ── История чатов
+    elif data == "history":
+        chats = list_chats(tg_user["user_id"])
+        if not chats:
+            await query.edit_message_text(
+                "Чатов пока нет\\.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("‹ Меню", callback_data="menu")
+                ]])
+            )
+            return
+        active_id = tg_user.get("active_chat_id")
+        buttons = []
+        for c in chats[:8]:
+            label = f"{'▶ ' if c['id'] == active_id else ''}{c['title']}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"switch_{c['id']}")])
+        buttons.append([InlineKeyboardButton("‹ Меню", callback_data="menu")])
+        await query.edit_message_text(
+            "📚 *Ваши чаты:*\nВыберите чат для переключения:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    # ── Переключение чата
+    elif data.startswith("switch_"):
+        chat_id = int(data.split("_")[1])
+        chat = get_chat(chat_id, tg_user["user_id"])
+        if chat:
+            db.set_telegram_active_chat(tg_user["telegram_id"], chat_id)
+            await query.edit_message_text(
+                f"✅ Переключились на: *{_esc(chat['title'])}*",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🗑️ Удалить чат", callback_data=f"deletechat_{chat_id}"),
+                    InlineKeyboardButton("‹ Меню", callback_data="menu"),
+                ]])
+            )
+
+    # ── Удалить чат
+    elif data.startswith("deletechat_"):
+        chat_id = int(data.split("_")[1])
+        user_id = tg_user["user_id"]
+        chat = get_chat(chat_id, user_id)
+        if chat:
+            if tg_user.get("active_chat_id") == chat_id:
+                db.set_telegram_active_chat(tg_user["telegram_id"], None)
+            db.delete_chat(chat_id)
+            await query.answer(f"Чат «{chat['title']}» удалён")
+        chats = list_chats(user_id)
+        if not chats:
+            await query.edit_message_text(
+                "Чатов больше нет\\.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("‹ Меню", callback_data="menu")
+                ]])
+            )
+            return
+        active_id = db.get_telegram_user(tg_user["telegram_id"]).get("active_chat_id")
+        buttons = []
+        for c in chats[:8]:
+            label = f"{'▶ ' if c['id'] == active_id else ''}{c['title']}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"switch_{c['id']}")])
+        buttons.append([InlineKeyboardButton("‹ Меню", callback_data="menu")])
+        await query.edit_message_text(
+            "📚 *Ваши чаты:*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    # ── MCP серверы
+    elif data == "servers":
+        servers = db.get_servers(tg_user["user_id"], active_only=False)
+        lines = ["🔌 *MCP серверы:*\n"]
+        for srv in servers:
+            cached = db.get_cached_tools(srv["id"]) or []
+            status = "🟢" if srv["is_active"] else "🔴"
+            lines.append(f"{status} *{_esc(srv['name'])}* — {len(cached)} инструментов")
+        if not servers:
+            lines.append("_Нет подключённых серверов_")
+        buttons = [
+            [InlineKeyboardButton("➕ Добавить сервер", callback_data="addserver")],
+        ]
+        if servers:
+            buttons.append([InlineKeyboardButton("🗑️ Удалить сервер", callback_data="removeserver")])
+        buttons.append([InlineKeyboardButton("‹ Меню", callback_data="menu")])
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    # ── Добавить сервер (запускаем ConversationHandler через сообщение)
+    elif data == "addserver":
+        await query.edit_message_text(
+            "🔌 *Добавление MCP сервера*\n\n"
+            "Шаг 1/3: Введите *название* сервера\n"
+            "_Например: GitHub, Wiki, Plane_\n\n"
+            "/cancel — отмена",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        context.user_data["adding_server"] = True
+        context.user_data["add_step"] = "name"
+
+    # ── Удалить сервер
+    elif data == "removeserver":
+        servers = [s for s in db.get_servers(tg_user["user_id"], active_only=False)
+                   if not s.get("is_builtin")]
+        if not servers:
+            await query.edit_message_text(
+                "Нет серверов для удаления\\.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("‹ Назад", callback_data="servers")
+                ]])
+            )
+            return
+        buttons = []
+        for srv in servers:
+            label = f"{'🟢' if srv['is_active'] else '🔴'} {srv['name']}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"del_{srv['id']}")])
+        buttons.append([InlineKeyboardButton("‹ Назад", callback_data="servers")])
+        await query.edit_message_text(
+            "🗑️ *Выберите сервер для удаления:*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    # ── Подтвердить удаление сервера
+    elif data.startswith("del_"):
+        server_id = int(data.split("_")[1])
+        user_id = tg_user["user_id"]
+        srv = db.get_server(server_id, user_id)
+        if srv:
+            db.delete_server(server_id, user_id)
+            loop = asyncio.get_event_loop()
+            invalidate_supervisor(user_id)
+            await loop.run_in_executor(None, lambda: reload_workers(user_id, force=True))
+            await query.edit_message_text(
+                f"✅ Сервер *{_esc(srv['name'])}* удалён\\.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("‹ К серверам", callback_data="servers")
+                ]])
+            )
+
+    # ── Помощь
+    elif data == "help":
+        await query.edit_message_text(
+            "❓ *Как пользоваться:*\n\n"
+            "Просто напишите вопрос в чат — ассистент сам выберет нужные источники\\.\n\n"
+            "*Команды:*\n"
+            "/menu — главное меню\n"
+            "/newchat — новый чат\n",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("‹ Меню", callback_data="menu")
+            ]])
+        )
+
+    # ── Вернуться в меню
+    elif data == "menu":
+        chat = _get_active_chat(tg_user)
+        await query.edit_message_text(
+            f"Активный чат: *{_esc(chat['title'])}*\nВыберите действие:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_main_menu_keyboard(),
+        )
+
+
+# ── Добавление сервера через текстовые шаги ───────────────────────────────────
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_user = _get_tg_user(update)
-    user_id = tg_user["user_id"]
-
-    await update.message.reply_text(f"⏳ Проверяю *{_esc(name)}*...", parse_mode=ParseMode.MARKDOWN)
-
-    loop = asyncio.get_event_loop()
-    client = MCPClient(url, api_key)
-    try:
-        ok, message = await loop.run_in_executor(None, client.probe)
-    except Exception as e:
-        ok, message = False, str(e)
-
-    if not ok:
-        await update.message.reply_text(f"❌ Не удалось подключиться:\n`{_esc(message)}`\n\nПопробуйте /addserver снова.",
-                                        parse_mode=ParseMode.MARKDOWN)
-        context.user_data.clear(); return ConversationHandler.END
-
-    try:
-        server_id = db.add_server(user_id, name, url, api_key)
-        tools = await loop.run_in_executor(None, client.get_tools_with_schema)
-        if tools:
-            db.cache_tools(server_id, user_id, tools)
-        await loop.run_in_executor(None, lambda: reload_workers(user_id, force=True))
-
-        tools_preview = "\n".join([f"  • `{t['name']}`" for t in tools[:8]])
-        if len(tools) > 8:
-            tools_preview += f"\n  _...и ещё {len(tools)-8}_"
-        await update.message.reply_text(
-            f"✅ *{_esc(name)}* подключён!\n\nИнструментов: {len(tools)}\n{tools_preview}",
-            parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-    context.user_data.clear(); return ConversationHandler.END
-
-async def addserver_cancel(update, context):
-    context.user_data.clear()
-    await update.message.reply_text("❌ Добавление отменено.")
-    return ConversationHandler.END
-
-
-# ── /removeserver conversation ────────────────────────────────────────────────
-
-async def removeserver_start(update, context):
-    tg_user = _get_tg_user(update)
-    servers = [s for s in db.get_servers(tg_user["user_id"], active_only=False) if not s.get("is_builtin")]
-    if not servers:
-        await update.message.reply_text("Нет серверов для удаления."); return ConversationHandler.END
-    lines = ["🗑️ *Какой сервер удалить?*\n"] + \
-            [f"{i}. {'🟢' if s['is_active'] else '🔴'} {_esc(s['name'])}" for i, s in enumerate(servers, 1)] + \
-            ["\nВведите номер или /cancel"]
-    context.user_data["servers_to_remove"] = servers
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-    return REMOVE_PICK
-
-async def removeserver_pick(update, context):
-    servers = context.user_data.get("servers_to_remove", [])
-    try:
-        n = int(update.message.text.strip())
-        assert 1 <= n <= len(servers)
-    except Exception:
-        await update.message.reply_text(f"Введите число от 1 до {len(servers)} или /cancel"); return REMOVE_PICK
-    srv = servers[n-1]
-    tg_user = _get_tg_user(update)
-    user_id = tg_user["user_id"]
-    db.delete_server(srv["id"], user_id)
-    loop = asyncio.get_event_loop()
-    invalidate_supervisor(user_id)
-    await loop.run_in_executor(None, lambda: reload_workers(user_id, force=True))
-    await update.message.reply_text(f"✅ Сервер *{_esc(srv['name'])}* удалён.", parse_mode=ParseMode.MARKDOWN)
-    context.user_data.clear(); return ConversationHandler.END
-
-async def removeserver_cancel(update, context):
-    context.user_data.clear()
-    await update.message.reply_text("❌ Удаление отменено.")
-    return ConversationHandler.END
-
-
-# ── Message handler ───────────────────────────────────────────────────────────
-
-async def handle_message(update, context):
-    tg_user = _get_tg_user(update)
-    chat = _get_active_chat(tg_user)
     text = update.message.text.strip()
+
+    # Шаги добавления сервера
+    if context.user_data.get("adding_server"):
+        step = context.user_data.get("add_step")
+
+        if step == "name":
+            if not text:
+                await update.message.reply_text("Название не может быть пустым. Введите название:"); return
+            existing = db.get_servers(tg_user["user_id"], active_only=False)
+            if any(s["name"].lower() == text.lower() for s in existing):
+                await update.message.reply_text(f"❌ Сервер *{_esc(text)}* уже существует. Введите другое название:",
+                                                parse_mode=ParseMode.MARKDOWN); return
+            context.user_data["srv_name"] = text
+            context.user_data["add_step"] = "url"
+            await update.message.reply_text(
+                f"✅ Название: *{_esc(text)}*\n\nШаг 2/3: Введите *URL* сервера\n"
+                f"_Например: http://localhost:8080_\n\n/cancel — отмена",
+                parse_mode=ParseMode.MARKDOWN)
+            return
+
+        if step == "url":
+            if not text.startswith(("http://", "https://")):
+                await update.message.reply_text("❌ URL должен начинаться с http:// или https://\nПовторите:"); return
+            context.user_data["srv_url"] = text
+            context.user_data["add_step"] = "apikey"
+            await update.message.reply_text(
+                f"✅ URL: `{text}`\n\nШаг 3/3: Введите *API Key*\n"
+                f"_Если не нужен — отправьте `-`_\n\n/cancel — отмена",
+                parse_mode=ParseMode.MARKDOWN)
+            return
+
+        if step == "apikey":
+            api_key = "" if text == "-" else text
+            name = context.user_data["srv_name"]
+            url = context.user_data["srv_url"]
+            user_id = tg_user["user_id"]
+
+            msg = await update.message.reply_text(f"⏳ Подключаюсь к *{_esc(name)}*...",
+                                                  parse_mode=ParseMode.MARKDOWN)
+            loop = asyncio.get_event_loop()
+            client = MCPClient(url, api_key)
+            try:
+                ok, message = await loop.run_in_executor(None, client.probe)
+            except Exception as e:
+                ok, message = False, str(e)
+
+            if not ok:
+                context.user_data.clear()
+                await msg.edit_text(f"❌ Не удалось подключиться:\n`{_esc(message)}`",
+                                    parse_mode=ParseMode.MARKDOWN,
+                                    reply_markup=InlineKeyboardMarkup([[
+                                        InlineKeyboardButton("‹ К серверам", callback_data="servers")
+                                    ]]))
+                return
+
+            try:
+                server_id = db.add_server(user_id, name, url, api_key)
+                tools = await loop.run_in_executor(None, client.get_tools_with_schema)
+                if tools:
+                    db.cache_tools(server_id, user_id, tools)
+                await loop.run_in_executor(None, lambda: reload_workers(user_id, force=True))
+
+                tools_preview = "\n".join([f"  • `{t['name']}`" for t in tools[:6]])
+                if len(tools) > 6:
+                    tools_preview += f"\n  _...и ещё {len(tools)-6}_"
+
+                await msg.edit_text(
+                    f"✅ *{_esc(name)}* подключён\\!\n\nИнструментов: {len(tools)}\n{tools_preview}",
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("‹ К серверам", callback_data="servers")
+                    ]])
+                )
+            except Exception as e:
+                await msg.edit_text(f"❌ Ошибка: {e}")
+
+            context.user_data.clear()
+            return
+
+    # Обычное сообщение — обрабатываем как запрос
+    chat = _get_active_chat(tg_user)
     await update.message.chat.send_action(ChatAction.TYPING)
 
     loop = asyncio.get_event_loop()
@@ -265,18 +395,26 @@ async def handle_message(update, context):
             await update.message.reply_text(part)
 
 
+# ── Команды ───────────────────────────────────────────────────────────────────
+
+async def cmd_newchat(update, context):
+    tg_user = _get_tg_user(update)
+    chat = create_new_chat(tg_user["user_id"], "Новый чат")
+    db.set_telegram_active_chat(tg_user["telegram_id"], chat["id"])
+    await update.message.reply_text("✅ Новый чат создан. Пишите вопрос!")
+
+async def cmd_cancel(update, context):
+    context.user_data.clear()
+    await update.message.reply_text("❌ Отменено.", reply_markup=_main_menu_keyboard())
+
+
 # ── Bot setup ─────────────────────────────────────────────────────────────────
 
 async def post_init(app):
     await app.bot.set_my_commands([
+        BotCommand("start", "Начать / главное меню"),
+        BotCommand("menu", "Главное меню"),
         BotCommand("newchat", "Новый чат"),
-        BotCommand("history", "История чатов"),
-        BotCommand("switch", "Переключить чат (/switch 2)"),
-        BotCommand("clear", "Очистить чат"),
-        BotCommand("servers", "Мои MCP серверы"),
-        BotCommand("addserver", "Добавить MCP сервер"),
-        BotCommand("removeserver", "Удалить MCP сервер"),
-        BotCommand("help", "Справка"),
     ])
 
 
@@ -287,27 +425,11 @@ def run():
 
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
-    add_conv = ConversationHandler(
-        entry_points=[CommandHandler("addserver", addserver_start)],
-        states={
-            ADD_NAME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, addserver_name)],
-            ADD_URL:    [MessageHandler(filters.TEXT & ~filters.COMMAND, addserver_url)],
-            ADD_APIKEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, addserver_apikey)],
-        },
-        fallbacks=[CommandHandler("cancel", addserver_cancel)],
-    )
-    rm_conv = ConversationHandler(
-        entry_points=[CommandHandler("removeserver", removeserver_start)],
-        states={REMOVE_PICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, removeserver_pick)]},
-        fallbacks=[CommandHandler("cancel", removeserver_cancel)],
-    )
-
-    app.add_handler(add_conv)
-    app.add_handler(rm_conv)
-    for cmd, fn in [("start", cmd_start), ("help", cmd_help), ("newchat", cmd_newchat),
-                    ("history", cmd_history), ("switch", cmd_switch),
-                    ("clear", cmd_clear), ("servers", cmd_servers)]:
-        app.add_handler(CommandHandler(cmd, fn))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("newchat", cmd_newchat))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Telegram bot started...")
