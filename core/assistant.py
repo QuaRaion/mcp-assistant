@@ -93,7 +93,7 @@ def process_message(user_id: int, chat_id: int, text: str) -> dict:
     if chat["title"] == "Новый чат" and db.count_messages(chat_id) == 1:
         try:
             title_resp = get_supervisor(user_id).llm.invoke([
-                SystemMessage(content="Generate a very short chat title (3-5 words max) based on the user's question. No quotes, no punctuation at the end. Reply with title only."),
+                SystemMessage(content="Generate a very short chat title (50 symbols max) based on the user's question. No quotes, no punctuation at the end. Reply with title only."),
                 HumanMessage(content=text),
             ])
             title = title_resp.content.strip()[:50]

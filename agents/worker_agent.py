@@ -13,9 +13,8 @@ from config import API_KEY, LLM_BASE_URL, LLM_MODEL
 
 logger = logging.getLogger(__name__)
 
-# Максимум итераций ReAct для обычных серверов.
-# Большинство задач решается за 1-2 итерации — лимит 3 страхует от петли.
-MAX_REACT_ITERATIONS = 3
+# максимум итераций ReAct для обычных серверов
+MAX_REACT_ITERATIONS = 20
 
 
 def _build_langchain_tool(mcp_client: MCPClient, tool_schema: dict) -> Tool:
@@ -191,9 +190,9 @@ class WorkerAgent:
                                 self._cache[call_key] = tool_result
                                 logger.info(f"Cached: {tool_name}")
 
-                    # Обрезаем большие результаты
-                    if len(str(tool_result)) > 5000:
-                        tool_result = str(tool_result)[:5000] + "... [truncated]"
+                    # большие результаты обрезаются:
+                    if len(str(tool_result)) > 10000:
+                        tool_result = str(tool_result)[:10000] + "... [truncated]"
 
                     messages.append(response)
                     messages.append(HumanMessage(content=f"Tool result:\n{tool_result}"))
