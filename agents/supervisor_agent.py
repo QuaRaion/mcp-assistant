@@ -73,9 +73,8 @@ class SupervisorAgent:
                 hints = generate_server_hints(name, tools, self.llm)
                 save_tools_hints(srv["id"], user_id, hints)
 
-            worker = self.factory.create(srv, tools, hints=hints)  # передаём hints
+            worker = self.factory.create(srv, tools, hints=hints)
 
-            worker = self.factory.create(srv, tools)
             if worker:
                 self._workers[name] = worker
                 result[name] = worker.tools_summary
@@ -239,17 +238,25 @@ Rules: check context first to resolve references. Use clarify only as last resor
         results = state.get("worker_results", [])
         if not results:
             return self._node_direct_llm(state)
-        if len(results) == 1 and isinstance(results[0]["result"], str) and len(results[0]["result"]) > 100:
-            return {"final_answer": results[0]["result"], "used_servers": [results[0]["server"]]}
+        # if len(results) == 1 and isinstance(results[0]["result"], str) and len(results[0]["result"]) > 100:
+        #     return {"final_answer": results[0]["result"], "used_servers": [results[0]["server"]]}
 
         results_text = "".join([f"\n=== {r['server']} ===\n{r['result']}\n" for r in results])
         used = [r["server"] for r in results]
-        messages = [SystemMessage(content="Synthesis agent. Combine sources into coherent answer. Same language as user. Be concise.")]
+
+        messages = [SystemMessage(content=(
+            "You are a synthesis agent. Answer the user's question directly and concisely "
+            "based on the provided data. Do not list URLs or sources. "
+            "Answer in the same language as the user."
+        ))]
         summary = state.get("summary", "")
+        
         if summary:
             messages.append(SystemMessage(content=f"Context:\n{summary}"))
         messages += self._build_lc_history(state.get("recent_history", [])[-4:])
+        
         messages.append(HumanMessage(content=f"Question: {state['user_query']}\n\nData:\n{results_text}\n\nAnswer:"))
+
         try:
             return {"final_answer": self.llm.invoke(messages).content, "used_servers": used}
         except Exception as e:

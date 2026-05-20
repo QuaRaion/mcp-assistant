@@ -12,7 +12,7 @@ BUILTIN_SERVER_NAME = "WebSearch"
 
 
 def _ddg_search(query: str, max_results: int = 3) -> str:
-    """Поиск через DuckDuckGo, возвращает форматированный текст."""
+    """Поиск через DuckDuckGo, возвращает форматированный текст"""
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=max_results))
