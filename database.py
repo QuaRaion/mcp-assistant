@@ -285,3 +285,17 @@ def should_update_summary(chat_id):
     row = get_summary(chat_id)
     last = row["messages_count"] if row else 0
     return (total - last) >= SUMMARY_EVERY
+
+def save_tools_hints(server_id, user_id, hints: str):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE mcp_servers SET tools_hints=? WHERE id=? AND user_id=?",
+            (hints, server_id, user_id)
+        )
+
+def get_tools_hints(server_id) -> str:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT tools_hints FROM mcp_servers WHERE id=?", (server_id,)
+        ).fetchone()
+    return row["tools_hints"] if row and row["tools_hints"] else ""

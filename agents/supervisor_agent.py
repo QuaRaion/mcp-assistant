@@ -5,15 +5,16 @@ load_workers() теперь принимает user_id и загружает т�
 
 import json, logging, asyncio, threading, concurrent.futures, operator
 from typing import TypedDict, Annotated
+from agents.worker_agent import generate_server_hints
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langgraph.graph import StateGraph, START, END
 
-from agents.worker_agent import WorkerAgent, WorkerAgentFactory
+from agents.worker_agent import WorkerAgent, WorkerAgentFactory, generate_server_hints
 from agents.builtin_search import get_builtin_search_tool, BUILTIN_SERVER_NAME, _ddg_search
 from mcp_client import MCPClient
-from database import get_servers, cache_tools, get_cached_tools, get_summary, save_summary, should_update_summary, get_messages, count_messages
+from database import get_servers, cache_tools, get_cached_tools, get_summary, save_summary, should_update_summary, get_messages, count_messages, save_tools_hints, get_tools_hints
 from config import API_KEY, LLM_BASE_URL, LLM_MODEL
 
 logger = logging.getLogger(__name__)
@@ -66,13 +67,21 @@ class SupervisorAgent:
             else:
                 tools = get_cached_tools(srv["id"]) or []
 
+            # После получения tools
+            hints = get_tools_hints(srv["id"])
+            if not hints and tools:  # генерируем один раз
+                hints = generate_server_hints(name, tools, self.llm)
+                save_tools_hints(srv["id"], user_id, hints)
+
+            worker = self.factory.create(srv, tools, hints=hints)  # передаём hints
+
             worker = self.factory.create(srv, tools)
             if worker:
                 self._workers[name] = worker
                 result[name] = worker.tools_summary
 
         return result
-
+    
     def get_available_server_names(self):
         return list(self._workers.keys())
 

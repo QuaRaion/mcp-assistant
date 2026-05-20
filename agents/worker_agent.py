@@ -63,7 +63,7 @@ def _build_langchain_tool(mcp_client: MCPClient, tool_schema: dict) -> Tool:
     return Tool(name=name, description=full_description, func=tool_func)
 
 
-def _build_system_prompt(server_name: str, tools_desc: str, tool_names: list[str]) -> str:
+def _build_system_prompt(server_name: str, tools_desc: str, tool_names: list[str], hints="") -> str:
     """
     Строит системный промпт для ReAct агента.
 
@@ -74,6 +74,7 @@ def _build_system_prompt(server_name: str, tools_desc: str, tool_names: list[str
     - Правило «один инструмент за раз»
     """
     tools_json = json.dumps(tool_names)
+    hints_block = f"\nSERVER-SPECIFIC RULES:\n{hints}" if hints else ""
 
     return f"""You are an agent working with '{server_name}'.
 
@@ -112,17 +113,45 @@ INPUT: {{}}
 TOOL: search_repositories
 INPUT: {{"query": "user:alice"}}
 [tool returns list]
-ANSWER: Your repositories: repo1, repo2, repo3"""
+ANSWER: Your repositories: repo1, repo2, repo3
+{hints_block}
+"""
 
+def generate_server_hints(server_name: str, tools_schema: list[dict], llm) -> str:
+    tools_desc = "\n".join([
+        f"- {t['name']}: {t.get('description', '')}"
+        for t in tools_schema
+    ])
+    prompt = f"""You are analyzing tools of MCP server '{server_name}'.
+
+Tools:
+{tools_desc}
+
+Identify if any tools must be called in a specific sequence or have dependencies.
+For example: 'to list user repos you must first call get_me to get the username'.
+
+Write 3-5 short rules in this format:
+- To do X: first call tool_a, then use result in tool_b.
+
+If there are no dependencies, write: No special sequences required.
+Be concise. Rules only, no explanations."""
+
+    try:
+        from langchain_core.messages import HumanMessage
+        resp = llm.invoke([HumanMessage(content=prompt)])
+        return resp.content.strip()
+    except Exception:
+        return ""
 
 class WorkerAgent:
-    def __init__(self, server_name: str, server_id: int, llm, tools: list, tools_summary: list[str]):
+    def __init__(self, server_name: str, server_id: int, llm, tools: list, tools_summary: list[str], hints=""):
         self.server_name = server_name
         self.server_id = server_id
         self.tools_summary = tools_summary
         self._llm = llm
         self._tools_map = {t.name: t for t in tools}
         self._cache = {}
+        self.hints = hints
 
     def run(self, task: str) -> str:
         tools_desc = "\n".join([
@@ -134,6 +163,7 @@ class WorkerAgent:
             self.server_name,
             tools_desc,
             list(self._tools_map.keys()),
+            hints=self.hints,
         )
 
         messages = [
@@ -224,7 +254,7 @@ class WorkerAgentFactory:
             model_kwargs={"tool_choice": "none"},
         )
 
-    def create(self, server_info: dict, tools_schema: list[dict]) -> WorkerAgent | None:
+    def create(self, server_info: dict, tools_schema: list[dict], hints="") -> WorkerAgent | None:
         if not tools_schema:
             logger.warning(f"No tools for server {server_info['name']}, skipping.")
             return None
@@ -239,6 +269,7 @@ class WorkerAgentFactory:
             llm=self._llm,
             tools=lc_tools,
             tools_summary=[t["name"] for t in tools_schema],
+            hints=hints,
         )
 
     def create_from_lc_tools(self, server_name: str, lc_tools: list[Tool]) -> WorkerAgent:
